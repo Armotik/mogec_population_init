@@ -1,0 +1,11 @@
+
+pyyaml
+geopandas
+osmnx
+pytest
+pandas
+matplotlib
+contextily
+numpy
+imageio
+shapely

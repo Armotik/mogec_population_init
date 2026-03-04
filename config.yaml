@@ -1,0 +1,82 @@
+project:
+  name: "Initialisation Population Batz-sur-Mer"
+  crs_epsg: 2154 # Lambert-93
+
+# --- 1. ZONE D'ÉTUDE ---
+study_area:
+  commune_name: "Batz-sur-Mer, Loire-Atlantique, France"
+  department_code: "44"
+  buffer_m: 200
+
+# --- 2. CHEMINS DES DONNÉES ---
+data_paths:
+  input:
+    bd_topo: "data/01_raw/BDTOPO/1_DONNEES_LIVRAISON_2025-12-00078/BDT_3-5_GPKG_LAMB93_D044_ED2025-12-15/BDT_3-5_GPKG_LAMB93_D044-ED2025-12-15.gpkg"
+    bd_topo_layer: "batiment"
+    bdnb: "data/01_raw/gpkg/bdnb.gpkg"
+    filosofi: "data/01_raw/Filosofi2021_carreaux_200m_shp/france_metro/carreaux_200m_met.shp"
+    schools_csv: "data/01_raw/fr-en-ecoles-effectifs-nb_classes.csv"
+
+  output:
+    interim_dir: "data/02_interim/"
+    final_export: "data/03_processed/population_batz_t0.gpkg"
+
+# --- 3. PARAMÈTRES DE FILTRAGE ET INITIALISATION ---
+filtering:
+  min_building_area_m2: 9
+  fallback_sqm_per_dwelling: 80
+
+# --- 4. STRUCTURE DÉMOGRAPHIQUE (Source: Dossier Complet INSEE 2022) ---
+demographics:
+  # Tableau POP T3 - Répartition par âge
+  age_pyramid:
+    under_15: 0.097    # 9.7% (Cible écoles primaires)
+    from_15_to_64: 0.479 # Actifs potentiels
+    over_65: 0.424      # Seniors (Vulnérabilité élevée)
+
+  # Tableau EMP T8 - Lieu de travail
+  employment:
+    total_emplois_lieu_travail: 578
+    travail_local_pct: 0.386  # 38.6% des actifs travaillent dans la commune
+    navetteurs_ext_pct: 0.614 # 61.4% quittent la commune le matin
+
+# --- 5. INFRASTRUCTURES (Source: CSV Ecoles + SIRENE) ---
+infrastructures:
+  schools:
+    alain_boutle:
+      capacity: 79
+      name: "ALAIN BOUTLE"
+    ste_marie:
+      capacity: 64
+      name: "STE MARIE-ST PIERRE"
+
+  # Horaires pour la machine à états GAMA
+  schedules:
+    school_start: "08:30"
+    school_end: "16:30"
+    work_start: "08:30"
+    work_end: "18:00"
+
+# --- 6. PARAMÈTRES DU SCÉNARIO (Xynthia - Nuit d'hiver) ---
+scenario:
+  name: "xynthia_winter_night_02h"
+  is_school_holiday: true # Février 2010
+
+  # A. Variables Résidentielles
+  residences:
+    r_rp: 0.355  # Résidences principales
+    r_rs: 0.611  # Résidences secondaires
+    tau_saison: 0.10  # 10% occupation RS en hiver
+    alpha_domicile: 0.95 # Nuit
+
+  # B. Variables Commerciales
+  commerce:
+    sqm_per_employee: 30
+    client_employee_ratio: 4
+    alpha_commerce: 0.0 # Nuit = vide
+
+  # C. Variables Plages & Tourisme
+  tourisme:
+    tau_meteo: 0.0 # Tempête
+    alpha_plage: 0.0
+    tau_occupation_lits: 0.10
