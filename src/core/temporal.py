@@ -58,12 +58,12 @@ def generer_matrice_horaire(df_batiments: gpd.GeoDataFrame, config: dict) -> gpd
                             lieu_actuel = dest_id  # Au travail
                         elif h in [12, 13]:
                             # 20% de chance d'aller au resto le midi, sinon domicile
-                            lieu_actuel = resto_midi_id if random.random() < 0.20 else "DOMICILE"
+                            lieu_actuel = resto_midi_id if random.random() < 0.20 else "DOMICILE" # Ou ils restent manger à leur bureau
 
                 # --- C. ROUTINE ACTIF NAVETTEUR ---
                 elif role == 'actif_navetteur':
                     if jour_scenario not in ['Samedi', 'Dimanche']:
-                        if 8 <= h <= 18:
+                        if 8 <= h <= 18: # trouver de meilleure plage pour les navetteurs + gaussien
                             lieu_actuel = "EXTERIEUR"  # Hors carte
 
                 # --- D. ROUTINE SENIOR ---
@@ -81,6 +81,10 @@ def generer_matrice_horaire(df_batiments: gpd.GeoDataFrame, config: dict) -> gpd
                     elif h in [19, 20]:
                         # 5% de chance de sortir dîner le soir
                         lieu_actuel = resto_soir_id if random.random() < 0.05 else "DOMICILE"
+
+                # AJOUTER DU TEMPS LIBRE POUR TOUS (courses, loisirs, etc.) + prendre en compte les vacances scolaires
+
+                # 1 PERSONNE DU FOYER VA EMMENER LES ENFANTS A L'ÉCOLE LE MATIN, VOIR POUR DÉFINIR LE FOYER FAMILIAL (ID FOYER) ET AVOIR UNE LOGIQUE DE DÉPLACEMENT FAMILIAL (ex : si un enfant va à l'école, un adulte du même foyer doit aussi se déplacer pour l'accompagner)
 
                 # --- 4. ASSIGNATION SPATIALE ---
                 if lieu_actuel == "DOMICILE":

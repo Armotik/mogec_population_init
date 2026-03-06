@@ -47,4 +47,15 @@ def bati_popule(bati_raw, boundary_poly, config):
     pop_ventilee = ventiler_population_residentielle(jointure, config)
 
     # 3. Nettoyage final (Clip)
-    return clip_to_strict_boundary(pop_ventilee, strict_boundary)
+    pop_cleaned = clip_to_strict_boundary(pop_ventilee, strict_boundary)
+
+    # 4. Ajout du profilage et des agendas (nécessaires pour les tests avancés)
+    from src.core.profiling import generer_profils_batiments
+    from src.core.agendas import generer_agendas_agents
+    from src.core.temporal import generer_matrice_horaire
+
+    pop_profiled = generer_profils_batiments(pop_cleaned)
+    pop_with_agendas = generer_agendas_agents(pop_profiled, config)
+    pop_final = generer_matrice_horaire(pop_with_agendas, config)
+
+    return pop_final

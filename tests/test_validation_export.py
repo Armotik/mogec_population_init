@@ -17,8 +17,8 @@ def test_validation_scientifique_export(config):
     gdf = gpd.read_file(path_export)
 
     # --- A. VALIDATION DES VOLUMES (Validité externe) ---
-    pop_totale = gdf['pop_t0'].sum()
-    batiments_occupes = len(gdf[gdf['pop_t0'] > 0])
+    pop_totale = gdf['pop_h0'].sum()
+    batiments_occupes = len(gdf[gdf['pop_h0'] > 0])
 
     # Rappel des chiffres de référence (Recensement permanent)
     ref_insee_permanent = 2799
@@ -35,13 +35,13 @@ def test_validation_scientifique_export(config):
 
     # --- B. VALIDATION DE LA CENTRALITÉ (Analyse de densité) ---
     # On calcule la densité d'occupation (agents par m2 de sol)
-    gdf['densite_relative'] = gdf['pop_t0'] / gdf.geometry.area
+    gdf['densite_relative'] = gdf['pop_h0'] / gdf.geometry.area
 
     # On isole le top 10% des bâtiments les plus denses (le "Cœur de ville")
     seuil_densite = gdf['densite_relative'].quantile(0.90)
     top_10_denses = gdf[gdf['densite_relative'] >= seuil_densite]
 
-    densite_moyenne_globale = gdf[gdf['pop_t0'] > 0]['densite_relative'].mean()
+    densite_moyenne_globale = gdf[gdf['pop_h0'] > 0]['densite_relative'].mean()
     densite_moyenne_centre = top_10_denses['densite_relative'].mean()
 
     ratio_centralite = densite_moyenne_centre / densite_moyenne_globale
@@ -52,7 +52,7 @@ def test_validation_scientifique_export(config):
     print(f"Indice de centralité : {ratio_centralite:.2f}x")
 
     # --- C. VALIDATION DU PROFILAGE ---
-    moyenne_senior = gdf[gdf['pop_t0'] > 0]['prob_senior'].mean()
+    moyenne_senior = gdf[gdf['pop_h0'] > 0]['prob_senior'].mean()
     print(f"\n--- ANALYSE SOCIODÉMOGRAPHIQUE ---")
     print(f"Part moyenne de seniors (65+) : {moyenne_senior:.2%}")
 

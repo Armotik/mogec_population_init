@@ -20,11 +20,11 @@ def generer_heatmap_batz(gpkg_path: str, output_path: str):
     logger.info(f"Chargement des données finales depuis {path.name}...")
     # On ne charge que les bâtiments habités pour la clarté de la carte
     gdf = gpd.read_file(path)
-    gdf_pop = gdf[gdf['pop_t0'] > 0].copy()
+    gdf_pop = gdf[gdf['pop_h0'] > 0].copy()
 
     # Calcul de la densité pour la couleur (agents / m2 de sol)
     # L'unité est petite, on multiplie pour avoir une échelle lisible
-    gdf_pop['densite_visu'] = (gdf_pop['pop_t0'] / gdf_pop.geometry.area) * 1000
+    gdf_pop['densite_visu'] = (gdf_pop['pop_h0'] / gdf_pop.geometry.area) * 1000
 
     logger.info("Génération de la heatmap...")
 

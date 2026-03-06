@@ -5,6 +5,8 @@ from src.core.spatial_join import join_buildings_to_grid
 from src.core.downscaling import ventiler_population_residentielle
 from src.core.cleaning import clip_to_strict_boundary
 from src.core.profiling import generer_profils_batiments
+from src.core.agendas import generer_agendas_agents
+from src.core.temporal import generer_matrice_horaire
 from src.io.exporters import exporter_pour_gama
 import geopandas as gpd
 
@@ -28,8 +30,12 @@ def test_full_pipeline_execution(bati_raw, boundary_poly, config):
     pop_nettoyee = clip_to_strict_boundary(pop_ventilee, strict_boundary)
     pop_profilee = generer_profils_batiments(pop_nettoyee)
 
-    # D. Export final
-    path_final = exporter_pour_gama(pop_profilee, config)
+    # D. Agendas & Dynamique Temporelle
+    pop_agendas = generer_agendas_agents(pop_profilee, config)
+    pop_temporelle = generer_matrice_horaire(pop_agendas, config)
+
+    # E. Export final
+    path_final = exporter_pour_gama(pop_temporelle, config)
 
     assert path_final.exists()
     print(f"\n[PIPELINE OK] Le fichier est prêt pour GAMA : {path_final}")
