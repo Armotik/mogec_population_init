@@ -1,29 +1,118 @@
+# -----------------------------------------------------------------------------
+# CONFIGURATION PRINCIPALE DU MODELE MOGEC
+# -----------------------------------------------------------------------------
+# Ce fichier pilote l'ensemble du pipeline :
+# - chargement des donnees ;
+# - generation de la population residente a T0 ;
+# - ajout des composantes non residentielles ;
+# - construction des foyers, des roles et des destinations ;
+# - production de la matrice horaire 24h ;
+# - export final pour GAMA.
+#
+# Lecture conseillee :
+# 1. `project` et `study_area` pour l'identite du projet et le territoire.
+# 2. `data_paths` pour savoir ou se trouvent les donnees.
+# 3. `demographics`, `destination_model`, `temporal_model` pour la logique metier.
+# 4. `non_residential_model` pour les populations touristiques, d'activite et de plage.
+# 5. `scenario` pour les conditions du cas simule.
+# -----------------------------------------------------------------------------
+
+# Informations globales du projet.
+# `random_seed` garantit la reproductibilite stricte des tirages aleatoires.
+# `building_id` decrit comment construire un identifiant stable par batiment.
 project:
   name: "Initialisation Population Batz-sur-Mer"
   crs_epsg: 2154 # Lambert-93
+  random_seed: 20260310
+  building_id:
+    # Prefixe ajoute aux identifiants stables.
+    prefix: "BATZ"
+    # Ordre de priorite des sources utilisees pour construire `building_id`.
+    # Si aucune cle metier n'est disponible, un hash geometrique est utilise.
+    source_priority: ["cleabs", "identifiants_rnb", "geometry_hash"]
 
 # --- 1. ZONE D'ÉTUDE ---
 study_area:
+  # Libelle libre de la commune d'etude.
   commune_name: "Batz-sur-Mer, Loire-Atlantique, France"
+  # Code INSEE de reference, utile pour certains filtres et controles.
+  commune_insee: "44010"
+  # Frontiere administrative locale preferee au geocoding OSM.
+  boundary_path: "data/01_raw/gpkg/referentiel_administratif.gpkg"
+  boundary_layer: "commune"
+  boundary_name_field: "libelle_commune"
+  boundary_name_value: "Batz-sur-Mer"
   department_code: "44"
+  # Buffer applique pour recuperer les batiments de bordure avant clip strict final.
   buffer_m: 200
 
 # --- 2. CHEMINS DES DONNÉES ---
 data_paths:
   input:
+    # Batiments BD TOPO : support geometrique principal du modele.
     bd_topo: "data/01_raw/BDTOPO/1_DONNEES_LIVRAISON_2025-12-00078/BDT_3-5_GPKG_LAMB93_D044_ED2025-12-15/BDT_3-5_GPKG_LAMB93_D044-ED2025-12-15.gpkg"
     bd_topo_layer: "batiment"
+    # BDNB optionnelle : reservee a des enrichissements complementaires.
     bdnb: "data/01_raw/gpkg/bdnb.gpkg"
+    # Carroyage INSEE/Filosofi : source de population agrégée.
     filosofi: "data/01_raw/Filosofi2021_carreaux_200m_shp/france_metro/carreaux_200m_met.shp"
+    # Source locale pour les capacites scolaires.
     schools_csv: "data/01_raw/fr-en-ecoles-effectifs-nb_classes.csv"
+    # Sources touristiques preparees ou brutes.
+    tourism_restaurants: "data/01_raw/tourisme_pdl/restaurants_pdl.csv"
+    tourism_hotels: "data/01_raw/tourisme_pdl/hotels_pdl.csv"
+    tourism_campings: "data/01_raw/tourisme_pdl/campings_pdl.csv"
+    tourism_residences: "data/01_raw/tourisme_pdl/residences_tourisme_pdl.csv"
+    tourism_collective: "data/01_raw/tourisme_pdl/hebergements_collectifs_pdl.csv"
+    tourism_locative: "data/01_raw/tourisme_pdl/hebergements_locatifs_pdl.csv"
+    beaches_raw: "data/01_raw/plages/plages_sable_loire_atlantique/dataset/N_PLAGE_L_044.shp"
+    tourism_capacity_insee: "data/01_raw/insee_tourisme/capacites_hebergements_touristiques.zip"
+    # Table preparee des restaurants apparies localement aux batiments.
+    audit_restaurants: "data/02_interim/external/batz_restaurants_prepared.csv"
 
   output:
+    # Dossier de travail pour les sorties intermediaires.
     interim_dir: "data/02_interim/"
+    # Export final consomme par GAMA et les notebooks de validation.
     final_export: "data/03_processed/population_batz_t0.gpkg"
+
+# Parametres de preparation des jeux externes avant le pipeline principal.
+# Cette section sert aux scripts de preparation, pas au coeur du modele horaire.
+external_preparation:
+  output_dir: "data/02_interim/external"
+  accommodation:
+    # Distance maximale pour apparier une offre touristique a un batiment.
+    match_max_distance_m: 120
+    # Types de batiments preferes lors du rattachement des offres.
+    preferred_usage_any_of: ["Commercial et services", "Indifférencié", "Résidentiel", "Agricole"]
+    capacity_rules:
+      # Calibrage Batz-sur-Mer 2026 :
+      # - hotels : 56 places Insee / 52 chambres declarees ~= 1.08
+      # - campings : 338 places Insee / 286 emplacements declares ~= 1.18
+      hotel_beds_per_room: 1.08
+      residence_beds_per_room: 2.0
+      camping_persons_per_pitch: 1.18
+  beaches:
+    # Les plages brutes sont lineaires ; on les transforme en zones via un buffer.
+    line_buffer_m: 15.0
+
+# Parametres de visualisation des scripts Python.
+# Ils n'affectent pas la simulation, seulement le rendu graphique.
+visualization:
+  destination_flows:
+    output_path: "data/04_visualization/batz_destination_flows.png"
+    min_flow_count: 2
+    top_destination_types: 8
+    top_destination_buildings: 12
+    annotate_top_destinations: 8
+    flow_width_scale: 0.30
+    figure_size: [22, 14]
 
 # --- 3. PARAMÈTRES DE FILTRAGE ET INITIALISATION ---
 filtering:
+  # Seuil de surface minimale pour eliminer les micro-polygones peu plausibles.
   min_building_area_m2: 9
+  # Valeur de secours si le nombre de logements manque pour certains batiments.
   fallback_sqm_per_dwelling: 80
 
 # --- 4. STRUCTURE DÉMOGRAPHIQUE (Source: Dossier Complet INSEE 2022) ---
@@ -40,9 +129,341 @@ demographics:
     travail_local_pct: 0.386  # 38.6% des actifs travaillent dans la commune
     navetteurs_ext_pct: 0.614 # 61.4% quittent la commune le matin
 
+  households:
+    # Si `true`, le modele impose exactement les volumes cibles de roles.
+    # Si `false`, il cherche seulement a s'en approcher.
+    enforce_exact_role_targets: true
+    # Distribution de taille des foyers.
+    size_distribution:
+      "1": 0.38
+      "2": 0.34
+      "3": 0.12
+      "4": 0.10
+      "5": 0.04
+      "6": 0.02
+    family_household_pct: 0.30
+    # Nombre minimal d'adultes lorsqu'un foyer contient au moins un enfant.
+    child_household_adult_min: 1
+    # Probabilite d'avoir 2 adultes dans un foyer avec enfant(s).
+    two_adults_if_children_pct: 0.65
+    # Probabilite qu'un menage d'une personne soit un senior.
+    single_senior_pct: 0.45
+    family_guardian:
+      # Repartition du role de l'adulte referent dans les foyers avec enfant(s).
+      actif_local_pct: 0.42
+      actif_navetteur_pct: 0.53
+      senior_pct: 0.05
+
+# Modele de destinations principales.
+# Cette section definit ou les agents peuvent aller selon leur role.
+destination_model:
+  # Valeur utilisee lorsqu'aucune destination interne plausible n'est disponible.
+  fallback_destination: "EXTERIEUR"
+  # Distance maximale par defaut pour chercher une destination interne.
+  default_max_distance_m: 5000
+  # Distance minimale pour eviter d'assigner un batiment trop proche artificiellement.
+  min_distance_m: 20
+  # Intensite de la decroissance gravitaire avec la distance.
+  distance_decay: 1.5
+  role_pools:
+    scolaire:
+      # Types de batiments autorises comme destination pour les scolaires.
+      usage_any_of: ["Enseignement"]
+      max_distance_m: 3000
+      distance_decay: 1.2
+      # Poids d'attractivite global du pool.
+      attractiveness_weight: 1.0
+      capacity:
+        # Capacite theorique estimee a partir de la surface.
+        source: "surface_based"
+        default_sqm_per_person: 20
+        usage_sqm_per_person:
+          Enseignement: 15
+    actif_local:
+      # Lieux potentiels de travail ou d'activite locale.
+      usage_any_of: ["Commercial et services", "Industriel", "Sportif"]
+      max_distance_m: 4500
+      distance_decay: 1.5
+      capacity:
+        source: "surface_based"
+        default_sqm_per_person: 30
+        usage_sqm_per_person:
+          Commercial et services: 30
+          Industriel: 45
+          Sportif: 25
+      attractiveness_by_usage:
+        # Coefficients multiplicatifs pour orienter les tirages vers certains usages.
+        Commercial et services: 1.15
+        Industriel: 1.00
+        Sportif: 0.85
+
+# Parametrage temporel fin des agendas.
+# Cette section pilote les depart/retour, les sorties seniors et les sensibilites
+# au contexte meteorologique ou d'alerte.
+temporal_model:
+  calendars:
+    # Jours consideres comme week-end par le moteur temporel.
+    weekend_days: ["Samedi", "Dimanche"]
+  scenario_context:
+    # Contexte par defaut ; il peut etre surcharge dans `scenario.temporal_context`.
+    season: "winter"
+    weather_index: 0.2
+    alert_level: 0.8
+    religious_day: false
+  modifiers:
+    # Sensibilites contextuelles : 0 = pas d'effet, 1 = effet maximal.
+    leisure_weather_sensitivity: 0.50
+    leisure_alert_sensitivity: 0.80
+    restaurant_weather_sensitivity: 0.35
+    restaurant_alert_sensitivity: 0.70
+    activity_weather_sensitivity: 0.60
+    activity_alert_sensitivity: 0.70
+  household_dynamics:
+    # Si actif, l'adulte referent peut aligner son depart sur celui des enfants.
+    enable_school_escort: true
+  role_profiles:
+    scolaire:
+      weekday:
+        enabled: true
+        departure:
+          # Distribution gaussienne du depart.
+          mean: 8.4
+          std: 0.35
+          min: 7
+          max: 10
+        return:
+          # Distribution gaussienne du retour.
+          mean: 16.7
+          std: 0.50
+          min: 15
+          max: 19
+      holiday:
+        enabled: false
+      weekend:
+        enabled: false
+    actif_local:
+      weekday:
+        enabled: true
+        departure:
+          mean: 8.2
+          std: 0.50
+          min: 6
+          max: 11
+        return:
+          mean: 17.8
+          std: 0.80
+          min: 15
+          max: 21
+        lunch:
+          # Repartition de la pause meridienne pour les actifs locaux.
+          at_home_probability: 0.55
+          at_restaurant_probability: 0.20
+          hours: [12, 13]
+      holiday:
+        enabled: false
+      weekend:
+        enabled: false
+    actif_navetteur:
+      weekday:
+        enabled: true
+        departure:
+          mean: 7.6
+          std: 0.55
+          min: 6
+          max: 10
+        return:
+          mean: 18.4
+          std: 0.90
+          min: 16
+          max: 22
+      holiday:
+        enabled: false
+      weekend:
+        enabled: false
+    senior:
+      weekday:
+        # Sorties seniors modelees de facon probabiliste.
+        market_probability: 0.45
+        market_hours: [10, 11]
+        midday_restaurant_probability: 0.10
+        midday_restaurant_hours: [12, 13]
+        afternoon_out_probability: 0.55
+        afternoon_out_hours: [15, 16]
+        evening_restaurant_probability: 0.05
+        evening_restaurant_hours: [19, 20]
+      weekend:
+        midday_restaurant_probability: 0.12
+        midday_restaurant_hours: [12, 13]
+        afternoon_out_probability: 0.45
+        afternoon_out_hours: [15, 16]
+        evening_restaurant_probability: 0.06
+        evening_restaurant_hours: [19, 20]
+      sunday:
+        # Frequence des sorties vers les lieux de culte le dimanche.
+        cult_probability: 0.15
+        cult_hours: [10, 11]
+
+# Rattachement des POI restaurants aux batiments BD TOPO.
+poi_matching:
+  restaurants:
+    # Rayon maximum pour apparier un POI restaurant a une emprise bati.
+    max_distance_m: 80
+    # Usages privilegies lors du matching.
+    preferred_usage_any_of: ["Commercial et services", "Indifférencié", "Résidentiel"]
+    allow_fallback_any_usage: true
+    # Si plusieurs restaurants tombent sur le meme batiment, concatene les noms.
+    concat_multiple_names: true
+    evidence:
+      source_name: "Audit restaurants OSM"
+      source_file: "data/01_raw/audit_restaurants_batz.csv"
+      extraction_note: "Points audités localement puis rapprochés de la BD TOPO"
+      verification_date: "2026-03-10"
+
+non_residential_model:
+  accommodation:
+    # Ajout optionnel des hebergements touristiques au `pop_t0`.
+    enabled: true
+    capacity_table: "data/02_interim/external/batz_accommodation_capacity.csv"
+    join_key: "building_id"
+    capacity_column: "capacity_lits"
+    # Taux d'occupation du scenario.
+    tau_occupation: 0.10
+    # Coefficient multiplicatif propre a l'heure/scenario de reference T0.
+    alpha_tourist_t0: 1.0
+    double_count_prevention:
+      enabled: true
+      # Definition du bati residentiel pour l'audit de double comptage.
+      residential_usage_any_of: ["Résidentiel"]
+      # Sources a exclure completement quand elles tombent sur du residentiel.
+      exclude_source_types_on_residential: ["locative"]
+      # Sources conservees mais a signaler dans l'audit.
+      warn_source_types_on_residential: ["residence"]
+    evidence:
+      # Schéma conseillé :
+      # - formula : expression utilisée dans le modèle
+      # - source_name : nom court de la source
+      # - source_type : article, open data, enquête terrain, expertise, etc.
+      # - source_file / source_url : preuve consultable
+      # - extraction_date : date de collecte ou de vérification
+      # - spatial_scope : zone de validité de la donnée
+      # - temporal_scope : période de validité de la donnée
+      # - unit : unité de la grandeur paramétrée
+      # - extraction_method : comment la valeur a été construite
+      # - processing_note : éventuelle transformation appliquée
+      # - confidence : niveau de confiance déclaré
+      # - uncertainty_note : limite connue ou intervalle d'incertitude
+      formula: "Pop_hebergement = Capacite_lits * tau_occupation * alpha_tourist_t0"
+      source_name: "DATAtourisme Pays de la Loire + Insee Capacites 2026"
+      source_type: "open_data"
+      source_file: "data/02_interim/external/batz_accommodation_capacity.csv"
+      source_url: "https://www.data.gouv.fr/fr/datasets/capacites-dhebergements-touristiques/"
+      extraction_date: "2026-03-10"
+      spatial_scope: "Batz-sur-Mer"
+      temporal_scope: "Capacites 2026, scenario-dependent pour l'occupation"
+      unit: "personnes"
+      extraction_method: "Appariement spatial des offres d'hebergement au bati puis calibration des coefficients sur les totaux Insee communaux"
+      processing_note: "Le detail de calibration est exporte dans data/02_interim/external/batz_accommodation_calibration.csv"
+      confidence: "medium"
+      uncertainty_note: "Les capacites de residence et locatifs restent partielles quand la source ne fournit ni lits ni personnes"
+  activities:
+    # Population exogene diurne dans les commerces et equipements.
+    enabled: true
+    profiles:
+      # Profils horaires nommes reutilisables dans `rules`.
+      commerce_day:
+        hour_slots:
+          - start: 7
+            end: 8
+            alpha: 0.05
+          - start: 9
+            end: 11
+            alpha: 0.12
+          - start: 12
+            end: 14
+            alpha: 0.18
+          - start: 15
+            end: 17
+            alpha: 0.14
+          - start: 18
+            end: 19
+            alpha: 0.08
+        other_hours_alpha: 0.0
+      equipement_day:
+        hour_slots:
+          - start: 8
+            end: 11
+            alpha: 0.06
+          - start: 12
+            end: 14
+            alpha: 0.08
+          - start: 15
+            end: 18
+            alpha: 0.10
+        other_hours_alpha: 0.0
+    rules:
+      # Chaque regle decrit une categorie de bati, une capacite theorique et un
+      # profil horaire d'occupation. `alpha_t0` controle seulement la part a T0.
+      - usage_any_of: ["Commercial et services"]
+        sqm_per_person: 45
+        client_ratio: 0.8
+        alpha_t0: 0.0
+        hourly_profile: "commerce_day"
+      - usage_any_of: ["Sportif", "Religieux"]
+        sqm_per_person: 35
+        client_ratio: 0.5
+        alpha_t0: 0.0
+        hourly_profile: "equipement_day"
+    evidence:
+      formula: "Pop_activite(t) = (surface / sqm_per_person) * (1 + client_ratio) * alpha_activite(t)"
+      source_name: "Hypothese de modelisation des activites diurnes"
+      source_type: "model_assumption"
+      source_file: "config.yaml"
+      source_url: ""
+      extraction_date: "2026-03-10"
+      spatial_scope: "Zone d'etude"
+      temporal_scope: "Scenario-dependent"
+      unit: "personnes"
+      extraction_method: "Capacite surfacique appliquee par categorie d'usage puis modulee par un profil horaire"
+      processing_note: "Cette composante represente des usagers exogenes non residentiels et vise a mieux restituer l'amplitude journaliere"
+      confidence: "low"
+      uncertainty_note: "Les coefficients horaires restent calibrables et doivent etre confrontes a des observations ou a des ordres de grandeur locaux"
+  beaches:
+    # Zones exogenes de plage, generalement reservees aux scenarios estivaux.
+    enabled: false
+    zones_path: "data/02_interim/external/batz_beaches.gpkg"
+    zones_layer: "beaches"
+    zone_id_column: "zone_id"
+    sqm_per_person: 5.0
+    hour_slots:
+      - start: 10
+        end: 12
+        alpha: 0.6
+      - start: 12
+        end: 16
+        alpha: 1.0
+      - start: 16
+        end: 19
+        alpha: 0.7
+    other_hours_alpha: 0.1
+    evidence:
+      formula: "Pop_plage = Capacite_plage * tau_meteo * alpha_plage(t)"
+      source_name: "A renseigner"
+      source_type: "open_data_or_field_observation"
+      source_file: ""
+      source_url: ""
+      extraction_date: ""
+      spatial_scope: "Plages de la commune"
+      temporal_scope: "Scenarios estivaux"
+      unit: "personnes"
+      extraction_method: "Capacite = surface / sqm_per_person puis modulation horaire"
+      processing_note: "Les coefficients alpha_plage(t) doivent etre relies a une source locale ou bibliographique"
+      confidence: "to_document"
+      uncertainty_note: ""
+
 # --- 5. INFRASTRUCTURES (Source: CSV Ecoles + SIRENE) ---
 infrastructures:
   schools:
+    # Capacites scolaires utilisees pour raisonner sur la plausibilite du pool.
     alain_boutle:
       capacity: 79
       name: "ALAIN BOUTLE"
@@ -59,14 +480,20 @@ infrastructures:
 
 # --- 6. PARAMÈTRES DU SCÉNARIO (Xynthia - Nuit d'hiver) ---
 scenario:
+  # Identifiant lisible du scenario. Il est exporte dans le GeoPackage final.
   name: "xynthia_winter_night_02h"
+  # Jour de la semaine de reference pour l'agenda.
+  day_of_week: "Jeudi"
   is_school_holiday: true # Février 2010
 
   # A. Variables Résidentielles
   residences:
+    # Repartition structurelle du parc de logements.
     r_rp: 0.355  # Résidences principales
     r_rs: 0.611  # Résidences secondaires
+    # Taux saisonnier d'occupation des residences secondaires.
     tau_saison: 0.10  # 10% occupation RS en hiver
+    # Presence au domicile a l'heure de reference T0.
     alpha_domicile: 0.95 # Nuit
 
   # B. Variables Commerciales
@@ -77,6 +504,8 @@ scenario:
 
   # C. Variables Plages & Tourisme
   tourisme:
+    # Coefficient meteorologique utilise notamment pour les plages.
     tau_meteo: 0.0 # Tempête
     alpha_plage: 0.0
+    # Taux d'occupation touristique global du scenario.
     tau_occupation_lits: 0.10

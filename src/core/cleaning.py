@@ -1,3 +1,11 @@
+"""
+Nettoyage spatial final aux limites strictes de la zone d'étude.
+
+Le pipeline lit d'abord les bâtiments avec un buffer pour limiter les effets de
+bord lors des jointures. Ce module retire ensuite les entités hors commune pour
+conserver uniquement le domaine final simulé dans GAMA.
+"""
+
 import logging
 import geopandas as gpd
 
@@ -8,6 +16,9 @@ def clip_to_strict_boundary(gdf: gpd.GeoDataFrame, strict_boundary_gdf: gpd.GeoD
     """
     Supprime les bâtiments situés dans la zone tampon (buffer) pour ne garder
     que ceux à l'intérieur des limites administratives réelles.
+
+    Le filtrage repose sur le centroïde, afin d'éviter de couper
+    artificiellement des bâtiments à cheval sur la limite.
     """
     logger.info("Découpage final : suppression des bâtiments hors limites administratives...")
 

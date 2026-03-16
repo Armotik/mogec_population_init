@@ -1,3 +1,11 @@
+"""
+Briques de préparation géométrique des bâtiments.
+
+Ce module intervient très tôt dans le pipeline : il filtre les emprises non
+pertinentes pour l'habitat puis calcule les centroïdes utilisés pour les
+jointures spatiales avec le carroyage INSEE et les limites communales.
+"""
+
 import logging
 import geopandas as gpd
 
@@ -8,12 +16,18 @@ def filter_buildings_by_area(gdf: gpd.GeoDataFrame, min_area_m2: float = 9.0) ->
     """
     Filtre les bâtiments dont l'emprise au sol est strictement inférieure au seuil (ex: 9m2).
 
-    Args:
-        gdf (gpd.GeoDataFrame): Les bâtiments à filtrer (doit être dans un CRS métrique, ex: EPSG:2154).
-        min_area_m2 (float): La surface minimale en mètres carrés.
+    Parameters
+    ----------
+    gdf:
+        Bâtiments à filtrer, idéalement déjà projetés dans un CRS métrique.
+    min_area_m2:
+        Surface minimale conservée. Les entités plus petites sont considérées
+        comme trop petites pour représenter des lieux de présence crédibles.
 
-    Returns:
-        gpd.GeoDataFrame: Les bâtiments filtrés.
+    Returns
+    -------
+    geopandas.GeoDataFrame
+        Sous-ensemble filtré, enrichi de `surface_sol` si nécessaire.
     """
     logger.info(f"Filtrage géométrique : suppression des polygones < {min_area_m2}m²...")
 
@@ -36,11 +50,16 @@ def compute_centroids(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     Calcule le centroïde de chaque polygone. Ce point servira pour la jointure
     spatiale (Point-in-Polygon) avec le carroyage INSEE.
 
-    Args:
-        gdf (gpd.GeoDataFrame): GeoDataFrame contenant des polygones.
+    Parameters
+    ----------
+    gdf:
+        GeoDataFrame contenant des géométries surfaciques.
 
-    Returns:
-        gpd.GeoDataFrame: Le même GeoDataFrame enrichi d'une colonne 'centroid'.
+    Returns
+    -------
+    geopandas.GeoDataFrame
+        Même table, avec une colonne `centroid` conservant la trace des points
+        sans écraser la géométrie polygonale d'origine.
     """
     logger.info("Calcul des centroïdes des bâtiments...")
     # On stocke le centroïde dans une nouvelle colonne pour ne pas écraser le polygone original (on en aura besoin plus tard)

@@ -1,3 +1,11 @@
+"""
+Script utilitaire d'audit des horaires d'ouverture OSM.
+
+Ce module n'est pas requis pour exécuter le pipeline principal. Il sert à
+préparer ou rafraîchir un CSV d'audit des restaurants, notamment pour mesurer
+la complétude du champ `opening_hours` avant l'étape d'intégration.
+"""
+
 import osmnx as ox
 import pandas as pd
 import logging
@@ -13,6 +21,11 @@ def auditer_horaires_osmnx(commune_name="Batz-sur-Mer, France",
     """
     Télécharge les lieux de restauration via OSMnx (plus robuste que l'API brute)
     et évalue la complétude des horaires d'ouverture.
+
+    Returns
+    -------
+    pandas.DataFrame | None
+        Table d'audit exportée en CSV, ou `None` en cas d'échec de la requête.
     """
     logger.info(f"Requête OSMnx pour {commune_name} (gestion auto des timeouts/cache)...")
 

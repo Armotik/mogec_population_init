@@ -1,3 +1,11 @@
+"""
+Ventilation résidentielle de la population à l'échelle du bâtiment.
+
+Cette brique traduit une population agrégée par carreau en effectifs par
+bâtiment résidentiel, à partir d'un indicateur de capacité et d'un correctif
+saisonnier sur les résidences secondaires.
+"""
+
 import logging
 import pandas as pd
 import geopandas as gpd
@@ -11,6 +19,10 @@ def calculer_capacite_residentielle(row, fallback_sqm: float) -> float:
     """
     Calcule l'indice de capacité d'un bâtiment (Priorité au nombre de logements).
     Si l'info est manquante, on estime via la surface au sol et la hauteur.
+
+    La capacité retournée n'est pas un nombre d'habitants mais un poids
+    relatif utilisé pour partager la population du carreau entre plusieurs
+    bâtiments résidentiels.
     """
     if pd.notna(row.get('nombre_de_logements')) and row['nombre_de_logements'] > 0:
         return float(row['nombre_de_logements'])
@@ -32,6 +44,18 @@ def ventiler_population_residentielle(jointure_gdf: gpd.GeoDataFrame, config: di
     """
     Applique la formule de descente d'échelle dasymétrique pour les bâtiments résidentiels.
     Inclut la correction d'arrondi par la méthode du plus fort reste pour ne pas perdre d'agents.
+
+    Parameters
+    ----------
+    jointure_gdf:
+        Bâtiments déjà enrichis avec les variables du carreau Filosofi.
+    config:
+        Paramètres de scénario et d'initialisation.
+
+    Returns
+    -------
+    geopandas.GeoDataFrame
+        GeoDataFrame enrichi d'une colonne `pop_t0`.
     """
     logger.info("Début de la ventilation de la population résidentielle...")
 

@@ -1,3 +1,11 @@
+"""
+Profilage sociodémographique des bâtiments.
+
+À partir des attributs statistiques du carreau associé, ce module calcule des
+probabilités simples que GAMA pourra ensuite réutiliser pour instancier des
+agents hétérogènes et des vulnérabilités sociales.
+"""
+
 import logging
 import geopandas as gpd
 logger = logging.getLogger(__name__)
@@ -7,6 +15,12 @@ def generer_profils_batiments(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     """
     Calcule les probabilités sociodémographiques pour chaque bâtiment
     en fonction des données du carreau INSEE associé.
+
+    Returns
+    -------
+    geopandas.GeoDataFrame
+        Table enrichie de probabilités d'âge, de structure de ménage et de
+        pauvreté. Ces probabilités restent agrégées à l'échelle bâtiment.
     """
     logger.info("Calcul des profils sociodémographiques (Profiling)...")
 

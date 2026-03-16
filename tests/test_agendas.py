@@ -28,5 +28,20 @@ def test_coherence_agendas(config, bati_popule):
     # Seniors (Cible ~42.4%)
     assert 0.35 <= (n_seniors / total_agents) <= 0.50
     # Vérification des destinations
+    assert 'building_id' in df_agenda.columns
+    assert 'n_households' in df_agenda.columns
     assert 'dest_id' in df_agenda.columns
     assert df_agenda['dest_id'].notnull().any()
+
+    if config['demographics']['households'].get('enforce_exact_role_targets', True):
+        pop_totale = int(df_agenda['pop_t0'].sum())
+        cible_scolaire = int(round(pop_totale * config['demographics']['age_pyramid']['under_15']))
+        cible_senior = int(round(pop_totale * config['demographics']['age_pyramid']['over_65']))
+        actifs = pop_totale - cible_scolaire - cible_senior
+        cible_local = int(round(actifs * config['demographics']['employment']['travail_local_pct']))
+        cible_navetteur = actifs - cible_local
+
+        assert n_scolaires == cible_scolaire
+        assert n_seniors == cible_senior
+        assert n_locaux == cible_local
+        assert n_navetteurs == cible_navetteur

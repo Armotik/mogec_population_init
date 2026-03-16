@@ -1,3 +1,10 @@
+"""
+Export cartographique du cycle journalier complet.
+
+Chaque heure de la matrice est représentée par une image distincte afin de
+faciliter une lecture séquentielle ou la création d'une animation.
+"""
+
 import logging
 from pathlib import Path
 import geopandas as gpd
@@ -11,6 +18,11 @@ def exporter_frames_24h(gpkg_path: str, output_dir: str):
     """
     Génère et sauvegarde 24 cartes de chaleur (une par heure)
     pour visualiser la répartition de la population.
+
+    Returns
+    -------
+    pathlib.Path
+        Dossier contenant les 24 images produites.
     """
     logger.info("Chargement des données pour l'export des 24 frames...")
     gdf = gpd.read_file(gpkg_path)

@@ -1,0 +1,70 @@
+extends: config.yaml
+
+scenario:
+  name: "summer_weekday_day"
+  day_of_week: "Jeudi"
+  is_school_holiday: true
+  residences:
+    r_rp: 0.355
+    r_rs: 0.611
+    tau_saison: 0.85
+    alpha_domicile: 0.60
+  tourisme:
+    tau_meteo: 1.0
+    alpha_plage: 1.0
+    tau_occupation_lits: 0.85
+  temporal_context:
+    season: "summer"
+    weather_index: 1.0
+    alert_level: 0.0
+    religious_day: false
+
+non_residential_model:
+  accommodation:
+    enabled: true
+    tau_occupation: 0.85
+    alpha_tourist_t0: 0.75
+  activities:
+    enabled: true
+    rules:
+      - usage_any_of: ["Commercial et services"]
+        sqm_per_person: 45
+        client_ratio: 0.8
+        alpha_t0: 0.12
+        hourly_profile: "commerce_day"
+      - usage_any_of: ["Sportif", "Religieux"]
+        sqm_per_person: 35
+        client_ratio: 0.5
+        alpha_t0: 0.08
+        hourly_profile: "equipement_day"
+  beaches:
+    enabled: true
+    zones_path: "data/02_interim/external/batz_beaches.gpkg"
+    zones_layer: "beaches"
+    zone_id_column: "zone_id"
+    sqm_per_person: 5.0
+    hour_slots:
+      - start: 10
+        end: 12
+        alpha: 0.6
+      - start: 12
+        end: 16
+        alpha: 1.0
+      - start: 16
+        end: 19
+        alpha: 0.7
+    other_hours_alpha: 0.15
+    evidence:
+      formula: "Pop_plage = Capacite_plage * tau_meteo * alpha_plage(t)"
+      source_name: "Plages de Loire-Atlantique + hypothese surfacique estivale"
+      source_type: "open_data_or_model_assumption"
+      source_file: "data/02_interim/external/batz_beaches.gpkg"
+      source_url: "https://www.data.gouv.fr/fr/datasets/plages-de-sable-en-loire-atlantique/"
+      extraction_date: "2026-03-10"
+      spatial_scope: "Batz-sur-Mer"
+      temporal_scope: "Scenario estival"
+      unit: "personnes"
+      extraction_method: "Capacite estimee par surface / sqm_per_person puis modulation horaire"
+      processing_note: "Le profil horaire est volontairement contrastif pour tester la sensibilite du modele"
+      confidence: "low"
+      uncertainty_note: "Les coefficients horaires doivent etre calibres sur des observations locales ou des comptages"

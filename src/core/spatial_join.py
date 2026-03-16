@@ -1,3 +1,11 @@
+"""
+Jointure spatiale entre bâtiments et carroyage INSEE.
+
+Le rôle de ce module est d'associer à chaque bâtiment les variables du carreau
+Filosofi dans lequel tombe son centroïde, afin de rendre possible la
+ventilation ultérieure de la population agrégée.
+"""
+
 import logging
 import geopandas as gpd
 
@@ -8,12 +16,17 @@ def join_buildings_to_grid(bati_gdf: gpd.GeoDataFrame, grid_gdf: gpd.GeoDataFram
     """
     Assigne chaque bâtiment à son carreau INSEE via son centroïde.
 
-    Args:
-        bati_gdf (gpd.GeoDataFrame): Bâtiments avec la colonne 'centroid'.
-        grid_gdf (gpd.GeoDataFrame): Carroyage INSEE.
+    Parameters
+    ----------
+    bati_gdf:
+        Bâtiments contenant une colonne `centroid`.
+    grid_gdf:
+        Carroyage INSEE/Filosofi avec variables démographiques.
 
-    Returns:
-        gpd.GeoDataFrame: Le GeoDataFrame des bâtiments enrichi des données du carroyage.
+    Returns
+    -------
+    geopandas.GeoDataFrame
+        Bâtiments enrichis des attributs de leur carreau d'appartenance.
     """
     logger.info("Début de la jointure spatiale (Bâtiments -> Carroyage INSEE)...")
 

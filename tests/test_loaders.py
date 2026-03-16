@@ -1,7 +1,7 @@
 
 
 def test_get_study_area_boundary(boundary_poly, config):
-    """Vérifie que le polygone de la commune est bien chargé et projeté."""
+    """Vérifie que le polygone local de la commune est bien chargé et projeté."""
     target_crs = config['project']['crs_epsg']
 
     assert not boundary_poly.empty

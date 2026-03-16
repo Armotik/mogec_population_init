@@ -1,3 +1,10 @@
+"""
+Graphique de synthèse du cycle journalier.
+
+Le module fournit une visualisation non spatiale, utile pour vérifier la
+"respiration urbaine" du modèle sans ouvrir de SIG.
+"""
+
 import logging
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -11,6 +18,13 @@ def plot_respiration_urbaine(df_horaire: gpd.GeoDataFrame, output_path: str):
     """
     Génère un graphique linéaire montrant l'évolution de la population
     présente dans les bâtiments de la commune de t=0 à t=23.
+
+    Parameters
+    ----------
+    df_horaire:
+        GeoDataFrame final contenant les colonnes `pop_h*`.
+    output_path:
+        Chemin de l'image PNG à générer.
     """
     logger.info("Génération du graphique de respiration urbaine...")
 

@@ -1,3 +1,10 @@
+"""
+Visualisation statique de la population à une heure donnée.
+
+Le cas d'usage principal de ce module est la production d'une carte de densité
+sur `pop_h0`, utile pour un contrôle visuel rapide du résultat exporté.
+"""
+
 import logging
 from pathlib import Path
 import geopandas as gpd
@@ -12,6 +19,13 @@ logger = logging.getLogger(__name__)
 def generer_heatmap_batz(gpkg_path: str, output_path: str):
     """
     Génère une carte de chaleur (heatmap) de la population ventilée à t=0.
+
+    Parameters
+    ----------
+    gpkg_path:
+        Chemin du GeoPackage exporté.
+    output_path:
+        Chemin de l'image PNG à produire.
     """
     path = Path(gpkg_path)
     if not path.exists():

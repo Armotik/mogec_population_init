@@ -5,6 +5,7 @@ osmnx
 pytest
 pandas
 matplotlib
+seaborn
 contextily
 numpy
 imageio

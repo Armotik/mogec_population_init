@@ -1,4 +1,6 @@
 import pytest
+import geopandas as gpd
+from shapely.geometry import Polygon
 from src.core.agendas import generer_agendas_agents
 from src.core.restaurants import integrer_restaurants_aux_batiments
 from src.core.cultes import integrer_lieux_culte
@@ -52,8 +54,53 @@ def test_matrice_horaire_complete(config, bati_popule):
         batiments_restos = df_horaire[df_horaire['is_restaurant'] == True]
         pop_restos_13h = batiments_restos['pop_h13'].sum()
         pop_restos_16h = batiments_restos['pop_h16'].sum()
+        pop_restos_03h = batiments_restos['pop_h3'].sum()
 
         print(f"Agents aux Restaurants à 13h : {pop_restos_13h}")
         print(f"Agents aux Restaurants à 16h : {pop_restos_16h}")
+        print(f"Agents aux Restaurants à 03h : {pop_restos_03h}")
 
         assert pop_restos_13h > pop_restos_16h, "Il devrait y avoir plus de monde au restaurant à 13h qu'à 16h."
+        assert pop_restos_03h == batiments_restos['pop_t0'].sum(), "La nuit, un restaurant ne doit contenir que ses résidents éventuels."
+
+
+def test_activites_exogenes_creent_un_pic_diurne(config):
+    config['scenario']['day_of_week'] = "Jeudi"
+    config['scenario']['temporal_context'] = {'weather_index': 1.0, 'alert_level': 0.0}
+    config['non_residential_model']['activities']['enabled'] = True
+    config['non_residential_model']['activities']['rules'] = [
+        {
+            'usage_any_of': ['Commercial et services'],
+            'sqm_per_person': 20,
+            'client_ratio': 1.0,
+            'alpha_t0': 0.0,
+            'hourly_profile': 'commerce_day',
+        }
+    ]
+    config['non_residential_model']['activities']['profiles'] = {
+        'commerce_day': {
+            'hour_slots': [
+                {'start': 11, 'end': 14, 'alpha': 0.5},
+            ],
+            'other_hours_alpha': 0.0,
+        }
+    }
+    config['temporal_model']['modifiers']['activity_weather_sensitivity'] = 0.0
+    config['temporal_model']['modifiers']['activity_alert_sensitivity'] = 0.0
+
+    df = gpd.GeoDataFrame(
+        {
+            'building_id': ['B1'],
+            'usage_1': ['Commercial et services'],
+            'surface_sol': [100.0],
+            'pop_t0': [0],
+            'households': [[]],
+        },
+        geometry=[Polygon([(0, 0), (0, 10), (10, 10), (10, 0)])],
+        crs='EPSG:2154',
+    )
+
+    resultat = generer_matrice_horaire(df, config)
+
+    assert int(resultat['pop_h0'].sum()) == 0
+    assert int(resultat['pop_h12'].sum()) > 0
