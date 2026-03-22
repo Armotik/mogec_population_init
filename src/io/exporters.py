@@ -31,7 +31,8 @@ def exporter_pour_gama(gdf: gpd.GeoDataFrame, config: dict):
     cols_a_garder = [
         'geometry', 'building_id', 'building_id_source', 'usage_1', 'nature', 'hauteur', 'pop_t0', 'dest_id',
         'prob_senior', 'prob_enfant', 'prob_pauvrete',
-        'n_scolaire', 'n_senior', 'n_actif_local', 'n_actif_navetteur', 'n_households',
+        'n_scolaire', 'n_scolaire_interne', 'n_scolaire_exterieur',
+        'n_senior', 'n_actif_local', 'n_actif_navetteur', 'n_inactif', 'n_households',
         'pop_nonres_accommodation', 'pop_nonres_activity',
         'accommodation_capacity_raw', 'accommodation_capacity_retained',
         'accommodation_source_types', 'accommodation_offer_names',
@@ -46,8 +47,9 @@ def exporter_pour_gama(gdf: gpd.GeoDataFrame, config: dict):
     cols_a_garder.extend(colonnes_heures)
     df_export['scenario_name'] = config['scenario']['name']
     df_export['day_of_week'] = config['scenario']['day_of_week']
+    df_export['reference_hour'] = int(config['scenario'].get('reference_hour', 0))
     df_export['random_seed'] = int(config['project']['random_seed'])
-    cols_a_garder.extend(['scenario_name', 'day_of_week', 'random_seed'])
+    cols_a_garder.extend(['scenario_name', 'day_of_week', 'reference_hour', 'random_seed'])
 
     # Nettoyage des types pour GAMA
     if 'dest_id' in df_export.columns:

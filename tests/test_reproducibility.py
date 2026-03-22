@@ -12,7 +12,7 @@ def test_pipeline_is_strictly_reproducible(config):
 
     colonnes = [
         'building_id', 'pop_t0', 'dest_id', 'n_scolaire', 'n_senior', 'n_actif_local',
-        'n_actif_navetteur', 'is_restaurant', 'is_culte'
+        'n_actif_navetteur', 'n_inactif', 'is_restaurant', 'is_culte'
     ] + [f'pop_h{hour}' for hour in range(24)]
 
     for colonne in colonnes:

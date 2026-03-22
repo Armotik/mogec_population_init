@@ -19,23 +19,54 @@ from src.core.randomness import build_rng
 logger = logging.getLogger(__name__)
 
 
+ROLE_KEYS = ['scolaire', 'senior', 'actif_local', 'actif_navetteur', 'inactif']
+
+
+def _employment_targets_for_adults(adult_pool: int, config: dict) -> dict[str, int]:
+    employment_cfg = config['demographics']['employment']
+    local_pct = float(employment_cfg.get('travail_local_pct', 0.0))
+    local_jobs_value = employment_cfg.get('total_emplois_lieu_travail')
+    local_jobs = int(local_jobs_value) if local_jobs_value is not None else None
+
+    employed_residents = adult_pool
+    if local_jobs is not None and local_pct > 0.0:
+        inferred_employed = int(round(local_jobs / local_pct))
+        employed_residents = min(adult_pool, max(inferred_employed, local_jobs))
+
+    if local_jobs is not None:
+        n_actif_local = min(employed_residents, local_jobs)
+    else:
+        n_actif_local = int(round(employed_residents * local_pct))
+
+    n_actif_navetteur = max(0, employed_residents - n_actif_local)
+    n_inactif = max(0, adult_pool - employed_residents)
+
+    return {
+        'actif_local': int(n_actif_local),
+        'actif_navetteur': int(n_actif_navetteur),
+        'inactif': int(n_inactif),
+    }
+
+
 def _adult_role_weights(config: dict) -> dict[str, float]:
     age_cfg = config['demographics']['age_pyramid']
-    employment_cfg = config['demographics']['employment']
 
     child_share = float(age_cfg['under_15'])
     senior_share = float(age_cfg['over_65'])
     non_child_total = max(1e-9, 1.0 - child_share)
     senior_weight = senior_share / non_child_total
-    active_weight = max(0.0, 1.0 - senior_weight)
-
-    local_pct = float(employment_cfg['travail_local_pct'])
-    commuter_pct = float(employment_cfg['navetteurs_ext_pct'])
+    employment_targets = _employment_targets_for_adults(1000, config)
+    local_pct = employment_targets['actif_local'] / 1000.0
+    commuter_pct = employment_targets['actif_navetteur'] / 1000.0
+    inactive_pct = employment_targets['inactif'] / 1000.0
+    total_adult_weight = local_pct + commuter_pct + inactive_pct
+    scale = max(0.0, 1.0 - senior_weight) / max(total_adult_weight, 1e-9)
 
     return {
         'senior': senior_weight,
-        'actif_local': active_weight * local_pct,
-        'actif_navetteur': active_weight * commuter_pct,
+        'actif_local': local_pct * scale,
+        'actif_navetteur': commuter_pct * scale,
+        'inactif': inactive_pct * scale,
     }
 
 
@@ -131,11 +162,11 @@ def _build_household_roles(size: int, rng: np.random.Generator, config: dict) ->
             else:
                 roles.append(_sample_adult_role(rng, config))
 
-    if 'scolaire' in roles and not any(role in {'actif_local', 'actif_navetteur', 'senior'} for role in roles):
-        roles[0] = 'actif_local'
+    if 'scolaire' in roles and not any(role in {'actif_local', 'actif_navetteur', 'senior', 'inactif'} for role in roles):
+        roles[0] = 'inactif'
 
     if size == 1 and roles[0] == 'scolaire':
-        roles[0] = 'actif_local'
+        roles[0] = 'inactif'
 
     return roles[:size]
 
@@ -147,24 +178,24 @@ def _role_counts(roles: list[str]) -> dict[str, int]:
         'n_senior': counts.get('senior', 0),
         'n_actif_local': counts.get('actif_local', 0),
         'n_actif_navetteur': counts.get('actif_navetteur', 0),
+        'n_inactif': counts.get('inactif', 0),
     }
 
 
 def _target_role_counts(population: int, config: dict) -> dict[str, int]:
     age_cfg = config['demographics']['age_pyramid']
-    employment_cfg = config['demographics']['employment']
 
     n_scolaire = int(round(population * float(age_cfg['under_15'])))
     n_senior = int(round(population * float(age_cfg['over_65'])))
-    n_active = max(0, population - n_scolaire - n_senior)
-    n_actif_local = int(round(n_active * float(employment_cfg['travail_local_pct'])))
-    n_actif_navetteur = max(0, n_active - n_actif_local)
+    adult_pool = max(0, population - n_scolaire - n_senior)
+    employment_targets = _employment_targets_for_adults(adult_pool, config)
 
     return {
         'scolaire': n_scolaire,
         'senior': n_senior,
-        'actif_local': n_actif_local,
-        'actif_navetteur': n_actif_navetteur,
+        'actif_local': employment_targets['actif_local'],
+        'actif_navetteur': employment_targets['actif_navetteur'],
+        'inactif': employment_targets['inactif'],
     }
 
 
@@ -195,28 +226,51 @@ def _rebalance_role_counts(households: list[dict], population: int, config: dict
         return False
 
     while current['scolaire'] < targets['scolaire']:
-        if not convert_one(['senior', 'actif_local', 'actif_navetteur'], 'scolaire', _can_convert_to_child):
+        if not convert_one(['senior', 'actif_local', 'actif_navetteur', 'inactif'], 'scolaire', _can_convert_to_child):
             break
 
     while current['scolaire'] > targets['scolaire']:
-        if not convert_one(['scolaire'], 'actif_local'):
+        fallback_role = 'inactif' if targets.get('inactif', 0) > current.get('inactif', 0) else 'actif_local'
+        if not convert_one(['scolaire'], fallback_role):
             break
 
     while current['senior'] < targets['senior']:
-        if not convert_one(['actif_local', 'actif_navetteur'], 'senior'):
+        if not convert_one(['actif_local', 'actif_navetteur', 'inactif'], 'senior'):
             break
 
     while current['senior'] > targets['senior']:
-        preferred_target = 'actif_navetteur' if current['actif_navetteur'] < targets['actif_navetteur'] else 'actif_local'
+        if current['inactif'] < targets['inactif']:
+            preferred_target = 'inactif'
+        else:
+            preferred_target = 'actif_navetteur' if current['actif_navetteur'] < targets['actif_navetteur'] else 'actif_local'
         if not convert_one(['senior'], preferred_target):
             break
 
+    while current['inactif'] < targets['inactif']:
+        if not convert_one(['actif_navetteur', 'actif_local'], 'inactif'):
+            break
+
+    while current['inactif'] > targets['inactif']:
+        preferred_target = 'actif_navetteur' if current['actif_navetteur'] < targets['actif_navetteur'] else 'actif_local'
+        if not convert_one(['inactif'], preferred_target):
+            break
+
     while current['actif_local'] < targets['actif_local']:
-        if not convert_one(['actif_navetteur'], 'actif_local'):
+        if not convert_one(['actif_navetteur', 'inactif'], 'actif_local'):
             break
 
     while current['actif_local'] > targets['actif_local']:
-        if not convert_one(['actif_local'], 'actif_navetteur'):
+        fallback_role = 'inactif' if current['inactif'] < targets['inactif'] else 'actif_navetteur'
+        if not convert_one(['actif_local'], fallback_role):
+            break
+
+    while current['actif_navetteur'] < targets['actif_navetteur']:
+        if not convert_one(['inactif', 'actif_local'], 'actif_navetteur'):
+            break
+
+    while current['actif_navetteur'] > targets['actif_navetteur']:
+        fallback_role = 'inactif' if current['inactif'] < targets['inactif'] else 'actif_local'
+        if not convert_one(['actif_navetteur'], fallback_role):
             break
 
     return households
@@ -240,6 +294,7 @@ def _assert_exact_global_role_counts(df: gpd.GeoDataFrame, config: dict) -> None
         'senior': int(df['n_senior'].sum()),
         'actif_local': int(df['n_actif_local'].sum()),
         'actif_navetteur': int(df['n_actif_navetteur'].sum()),
+        'inactif': int(df['n_inactif'].sum()),
     }
     if realized != targets:
         raise ValueError(
@@ -281,29 +336,52 @@ def _rebalance_global_households(df: gpd.GeoDataFrame, config: dict) -> gpd.GeoD
         return False
 
     while current['scolaire'] < targets['scolaire']:
-        if not convert_one(['senior', 'actif_local', 'actif_navetteur'], 'scolaire', _can_convert_reference_to_child):
-            if not convert_one(['senior', 'actif_local', 'actif_navetteur'], 'scolaire'):
+        if not convert_one(['senior', 'actif_local', 'actif_navetteur', 'inactif'], 'scolaire', _can_convert_reference_to_child):
+            if not convert_one(['senior', 'actif_local', 'actif_navetteur', 'inactif'], 'scolaire'):
                 break
 
     while current['scolaire'] > targets['scolaire']:
-        if not convert_one(['scolaire'], 'actif_local'):
+        fallback_role = 'inactif' if targets.get('inactif', 0) > current.get('inactif', 0) else 'actif_local'
+        if not convert_one(['scolaire'], fallback_role):
             break
 
     while current['senior'] < targets['senior']:
-        if not convert_one(['actif_local', 'actif_navetteur'], 'senior'):
+        if not convert_one(['actif_local', 'actif_navetteur', 'inactif'], 'senior'):
             break
 
     while current['senior'] > targets['senior']:
-        preferred_target = 'actif_navetteur' if current['actif_navetteur'] < targets['actif_navetteur'] else 'actif_local'
+        if current['inactif'] < targets['inactif']:
+            preferred_target = 'inactif'
+        else:
+            preferred_target = 'actif_navetteur' if current['actif_navetteur'] < targets['actif_navetteur'] else 'actif_local'
         if not convert_one(['senior'], preferred_target):
             break
 
+    while current['inactif'] < targets['inactif']:
+        if not convert_one(['actif_navetteur', 'actif_local'], 'inactif'):
+            break
+
+    while current['inactif'] > targets['inactif']:
+        preferred_target = 'actif_navetteur' if current['actif_navetteur'] < targets['actif_navetteur'] else 'actif_local'
+        if not convert_one(['inactif'], preferred_target):
+            break
+
     while current['actif_local'] < targets['actif_local']:
-        if not convert_one(['actif_navetteur'], 'actif_local'):
+        if not convert_one(['actif_navetteur', 'inactif'], 'actif_local'):
             break
 
     while current['actif_local'] > targets['actif_local']:
-        if not convert_one(['actif_local'], 'actif_navetteur'):
+        fallback_role = 'inactif' if current['inactif'] < targets['inactif'] else 'actif_navetteur'
+        if not convert_one(['actif_local'], fallback_role):
+            break
+
+    while current['actif_navetteur'] < targets['actif_navetteur']:
+        if not convert_one(['inactif', 'actif_local'], 'actif_navetteur'):
+            break
+
+    while current['actif_navetteur'] > targets['actif_navetteur']:
+        fallback_role = 'inactif' if current['inactif'] < targets['inactif'] else 'actif_local'
+        if not convert_one(['actif_navetteur'], fallback_role):
             break
 
     return df
@@ -342,7 +420,7 @@ def _build_households_for_row(row, df: gpd.GeoDataFrame, config: dict, rng: np.r
 
     for household in households:
         school_destination = None
-        guardian_candidates = [member['member_id'] for member in household['members'] if member['role'] in {'actif_local', 'actif_navetteur', 'senior'}]
+        guardian_candidates = [member['member_id'] for member in household['members'] if member['role'] in {'actif_local', 'actif_navetteur', 'senior', 'inactif'}]
         household['guardian_member_id'] = guardian_candidates[0] if any(member['role'] == 'scolaire' for member in household['members']) and guardian_candidates else None
 
         for member in household['members']:
@@ -377,12 +455,75 @@ def _major_destination(households: list[dict]) -> str | None:
     return Counter(destinations).most_common(1)[0][0]
 
 
+def _school_capacity_total(config: dict) -> int:
+    return sum(
+        int(school_cfg.get('capacity', 0))
+        for school_cfg in config.get('infrastructures', {}).get('schools', {}).values()
+        if isinstance(school_cfg, dict)
+    )
+
+
+def _enforce_local_school_capacity(df: gpd.GeoDataFrame, config: dict) -> gpd.GeoDataFrame:
+    capacity_total = _school_capacity_total(config)
+    if capacity_total <= 0:
+        return df
+
+    fallback_destination = config['destination_model'].get('fallback_destination', 'EXTERIEUR')
+    building_by_id = df.set_index('building_id')
+    school_refs: list[tuple[float, int, int, int]] = []
+
+    for row_index, households in df['households'].items():
+        origin = df.loc[row_index]
+        origin_centroid = origin.geometry.centroid
+        for household_index, household in enumerate(households):
+            for member_index, member in enumerate(household['members']):
+                if member.get('role') != 'scolaire':
+                    continue
+                destination_id = member.get('destination_id')
+                if destination_id in {'EXTERIEUR', 'DOMICILE', 'None', None}:
+                    continue
+                if destination_id not in building_by_id.index:
+                    member['destination_id'] = fallback_destination
+                    continue
+                destination_centroid = building_by_id.loc[destination_id].geometry.centroid
+                distance_m = float(origin_centroid.distance(destination_centroid))
+                school_refs.append((distance_m, row_index, household_index, member_index))
+
+    if len(school_refs) <= capacity_total:
+        return df
+
+    school_refs.sort(key=lambda item: item[0])
+    overflow = school_refs[capacity_total:]
+    for _, row_index, household_index, member_index in overflow:
+        df.at[row_index, 'households'][household_index]['members'][member_index]['destination_id'] = fallback_destination
+
+    return df
+
+
+def _school_assignment_counts(households: list[dict]) -> dict[str, int]:
+    internal = 0
+    external = 0
+    for household in households:
+        for member in household['members']:
+            if member.get('role') != 'scolaire':
+                continue
+            destination_id = member.get('destination_id')
+            if destination_id in {'EXTERIEUR', 'None', None}:
+                external += 1
+            else:
+                internal += 1
+    return {
+        'n_scolaire_interne': internal,
+        'n_scolaire_exterieur': external,
+    }
+
+
 def _refresh_households_for_row(row, df: gpd.GeoDataFrame, config: dict, rng: np.random.Generator) -> list[dict]:
     households = row['households']
 
     for household in households:
         school_destination = None
-        guardian_candidates = [member['member_id'] for member in household['members'] if member['role'] in {'actif_local', 'actif_navetteur', 'senior'}]
+        guardian_candidates = [member['member_id'] for member in household['members'] if member['role'] in {'actif_local', 'actif_navetteur', 'senior', 'inactif'}]
         household['guardian_member_id'] = guardian_candidates[0] if any(member['role'] == 'scolaire' for member in household['members']) and guardian_candidates else None
 
         for member in household['members']:
@@ -419,13 +560,18 @@ def generer_agendas_agents(gdf_batiments: gpd.GeoDataFrame, config: dict) -> gpd
     df = _rebalance_global_households(df, config)
     rng_dest = build_rng(config, "agendas_destinations")
     df['households'] = df.apply(lambda row: _refresh_households_for_row(row, df, config, rng_dest), axis=1)
+    df = _enforce_local_school_capacity(df, config)
 
     df['liste_roles'] = df['households'].apply(_flatten_roles)
     df['n_households'] = df['households'].apply(len)
 
     counts = df['liste_roles'].apply(_role_counts)
-    for column in ['n_scolaire', 'n_senior', 'n_actif_local', 'n_actif_navetteur']:
+    for column in ['n_scolaire', 'n_senior', 'n_actif_local', 'n_actif_navetteur', 'n_inactif']:
         df[column] = counts.apply(lambda item: item[column])
+
+    school_counts = df['households'].apply(_school_assignment_counts)
+    for column in ['n_scolaire_interne', 'n_scolaire_exterieur']:
+        df[column] = school_counts.apply(lambda item: item[column])
 
     df['dest_id'] = df['households'].apply(_major_destination)
 

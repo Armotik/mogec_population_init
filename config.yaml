@@ -221,6 +221,10 @@ temporal_model:
   household_dynamics:
     # Si actif, l'adulte referent peut aligner son depart sur celui des enfants.
     enable_school_escort: true
+    # Distance maximale pour considerer qu'un enfant peut rejoindre l'ecole a pied.
+    school_walk_max_distance_m: 1200
+    # Tolérance horaire pour qu'un parent recupere l'enfant sur le trajet du retour.
+    school_pickup_overlap_hours: 1
   role_profiles:
     scolaire:
       weekday:
@@ -485,6 +489,8 @@ scenario:
   # Jour de la semaine de reference pour l'agenda.
   day_of_week: "Jeudi"
   is_school_holiday: true # Février 2010
+  # Heure reelle correspondant a T0 dans le scenario.
+  reference_hour: 2
 
   # A. Variables Résidentielles
   residences:

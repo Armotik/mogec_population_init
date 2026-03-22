@@ -91,6 +91,7 @@ Le fichier contrôle notamment :
 - les paramètres démographiques ;
 - les règles de destination ;
 - les profils temporels ;
+- l'heure réelle correspondant à `T0` via `scenario.reference_hour` ;
 - les composantes non résidentielles ;
 - les preuves et niveaux de confiance associés.
 
@@ -147,8 +148,9 @@ Le fichier principal est :
 Il contient notamment :
 - `building_id` : identifiant stable ;
 - `usage_1` : type d'usage du bâtiment ;
-- `pop_t0` : population présente à l'état initial ;
+- `pop_t0` : population présente à l'état initial du scénario, correspondant à `scenario.reference_hour` ;
 - `pop_h0` à `pop_h23` : population présente par heure ;
+- `reference_hour` : heure réelle associée à `T0` ;
 - `n_scolaire`, `n_senior`, `n_actif_local`, `n_actif_navetteur` ;
 - `pop_nonres_accommodation`, `pop_nonres_activity` ;
 - colonnes d'audit du double comptage ;
@@ -172,6 +174,38 @@ Deux notebooks servent à la lecture scientifique du modèle.
 
 - `notebooks/validation_scientifique_modele.ipynb`
   Validation interne : structure du GeoPackage, métriques globales, rôle cible vs rôle réalisé, non résidentiel, bâtiments les plus variables.
+
+Un script autonome permet de générer un dossier de validation réutilisable hors notebook :
+
+```bash
+./.venv/bin/python scripts/generate_scientific_validation.py --config config.yaml
+```
+
+Un second script génère un explorateur HTML autonome pour visualiser les profils, leurs activités et suivre un individu heure par heure :
+
+```bash
+./.venv/bin/python scripts/generate_profile_activity_explorer.py --config config.yaml
+```
+
+Pour une exploration web locale servie en direct, avec lecture horaire, filtre par foyer, suivi individuel et fond satellite :
+
+```bash
+./.venv/bin/python scripts/run_realtime_profile_explorer.py --config config.yaml
+```
+
+Cette interface permet aussi d'ajuster en direct quelques parametres clefs du scenario et de recalculer la simulation sans modifier le fichier YAML sur disque.
+Elle expose aussi un `Patch YAML session` pour tester rapidement des variations de configuration directement depuis la preview.
+
+Voir aussi :
+
+- `docs/validation_scientifique.md`
+  Cadre méthodologique détaillé pour distinguer cohérence interne, traçabilité des hypothèses et confrontation externe.
+- `docs/exploration_profils.md`
+  Mode d'emploi des explorateurs de profils, en HTML autonome ou en serveur web local, pour filtrer un rôle, suivre un agent ou un foyer et lire les activités simulées dans le temps.
+
+Le dossier généré contient aussi `external_proxy_validation.csv`, qui compare le modèle à quelques proxys publics déjà mobilisés dans la configuration, par exemple les emplois locaux et les capacités scolaires.
+L'explorateur HTML est écrit par défaut dans `data/04_visualization/profile_activity_explorer.html`.
+Le serveur web local expose par défaut l'interface sur `http://127.0.0.1:8765`.
 
 ## Tests
 

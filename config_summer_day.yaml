@@ -4,6 +4,7 @@ scenario:
   name: "summer_weekday_day"
   day_of_week: "Jeudi"
   is_school_holiday: true
+  reference_hour: 14
   residences:
     r_rp: 0.355
     r_rs: 0.611
