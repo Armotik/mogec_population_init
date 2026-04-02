@@ -255,3 +255,132 @@ def test_parent_peut_deposer_enfant_avant_travail():
     assert parent['timeline_destinations'][8] == 'SCHOOL'
     assert parent['timeline_destinations'][9] == 'WORK'
     assert 17 in parent['escort_stop_hours']
+
+
+def test_scolaire_peut_revenir_a_domicile_le_midi():
+    config = {
+        'scenario': {
+            'day_of_week': 'Jeudi',
+            'is_school_holiday': False,
+            'temporal_context': {},
+        },
+        'project': {'random_seed': 123},
+        'temporal_model': {
+            'calendars': {'weekend_days': ['Samedi', 'Dimanche']},
+            'scenario_context': {'weather_index': 1.0, 'alert_level': 0.0, 'religious_day': False},
+            'modifiers': {},
+            'household_dynamics': {
+                'enable_school_escort': False,
+                'school_walk_max_distance_m': 500,
+                'school_pickup_overlap_hours': 1,
+            },
+            'role_profiles': {
+                'scolaire': {
+                    'weekday': {
+                        'enabled': True,
+                        'departure': {'mean': 8.0, 'std': 0.0, 'min': 8, 'max': 8},
+                        'return': {'mean': 16.0, 'std': 0.0, 'min': 16, 'max': 16},
+                        'lunch': {
+                            'hours': [12, 13],
+                            'at_home_probability_by_hour': {12: 1.0, 13: 0.0},
+                        },
+                    }
+                },
+            },
+        },
+    }
+
+    gdf = gpd.GeoDataFrame(
+        {
+            'building_id': ['HOME', 'SCHOOL'],
+            'usage_1': ['Résidentiel', 'Enseignement'],
+            'households': [[{
+                'household_id': 'HH1',
+                'guardian_member_id': None,
+                'members': [
+                    {'member_id': 'child', 'role': 'scolaire', 'destination_id': 'SCHOOL'},
+                ],
+            }], []],
+        },
+        geometry=[
+            Polygon([(0, 0), (0, 10), (10, 10), (10, 0)]),
+            Polygon([(100, 0), (100, 10), (110, 10), (110, 0)]),
+        ],
+        crs='EPSG:2154',
+    )
+
+    timelines = build_member_timelines(gdf, config)
+    child = timelines.loc[timelines['member_id'] == 'child'].iloc[0]
+
+    assert child['timeline_destinations'][9] == 'SCHOOL'
+    assert child['timeline_destinations'][12] == 'DOMICILE'
+    assert child['timeline_destinations'][13] == 'SCHOOL'
+
+
+def test_scolaire_respecte_un_profil_horaire_de_presence():
+    config = {
+        'scenario': {
+            'day_of_week': 'Jeudi',
+            'is_school_holiday': False,
+            'temporal_context': {},
+        },
+        'project': {'random_seed': 123},
+        'temporal_model': {
+            'calendars': {'weekend_days': ['Samedi', 'Dimanche']},
+            'scenario_context': {'weather_index': 1.0, 'alert_level': 0.0, 'religious_day': False},
+            'modifiers': {},
+            'household_dynamics': {
+                'enable_school_escort': False,
+                'school_walk_max_distance_m': 500,
+                'school_pickup_overlap_hours': 1,
+            },
+            'role_profiles': {
+                'scolaire': {
+                    'weekday': {
+                        'enabled': True,
+                        'departure': {'mean': 8.0, 'std': 0.0, 'min': 8, 'max': 8},
+                        'return': {'mean': 16.0, 'std': 0.0, 'min': 16, 'max': 16},
+                        'attendance_probability_by_hour': {
+                            8: 0.0,
+                            9: 1.0,
+                            10: 1.0,
+                            11: 1.0,
+                            12: 0.0,
+                            13: 0.0,
+                            14: 1.0,
+                            15: 1.0,
+                            16: 0.0,
+                        },
+                    }
+                },
+            },
+        },
+    }
+
+    gdf = gpd.GeoDataFrame(
+        {
+            'building_id': ['HOME', 'SCHOOL'],
+            'usage_1': ['Résidentiel', 'Enseignement'],
+            'households': [[{
+                'household_id': 'HH1',
+                'guardian_member_id': None,
+                'members': [
+                    {'member_id': 'child', 'role': 'scolaire', 'destination_id': 'SCHOOL'},
+                ],
+            }], []],
+        },
+        geometry=[
+            Polygon([(0, 0), (0, 10), (10, 10), (10, 0)]),
+            Polygon([(100, 0), (100, 10), (110, 10), (110, 0)]),
+        ],
+        crs='EPSG:2154',
+    )
+
+    timelines = build_member_timelines(gdf, config)
+    child = timelines.loc[timelines['member_id'] == 'child'].iloc[0]
+
+    assert child['timeline_destinations'][8] == 'DOMICILE'
+    assert child['timeline_destinations'][9] == 'SCHOOL'
+    assert child['timeline_destinations'][12] == 'DOMICILE'
+    assert child['timeline_destinations'][14] == 'SCHOOL'
+    assert child['timeline_destinations'][16] == 'DOMICILE'

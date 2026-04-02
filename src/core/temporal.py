@@ -18,6 +18,13 @@ from src.core.randomness import build_rng
 from src.core.restaurants import restaurants_ouverts_a_l_heure
 
 logger = logging.getLogger(__name__)
+HOME_DESTINATION = "DOMICILE"
+OUTSIDE_DESTINATIONS = {"EXTERIEUR", "None", None}
+NON_INTERNAL_DESTINATIONS = {HOME_DESTINATION, *OUTSIDE_DESTINATIONS}
+SCHOOL_ROLE = "scolaire"
+LOCAL_WORKER_ROLE = "actif_local"
+COMMUTER_ROLE = "actif_navetteur"
+SENIOR_ROLE = "senior"
 
 
 def _parse_hour_slot(time_str: str, end: bool = False) -> int:
@@ -96,10 +103,8 @@ def _sample_gaussian_hour(distribution: dict, rng: np.random.Generator) -> int:
     return int(np.clip(hour, int(distribution['min']), int(distribution['max'])))
 
 
-def _member_schedule(member: dict, config: dict, rng: np.random.Generator) -> dict:
-    role = member['role']
-    profile = _resolve_role_profile(role, config)
-    schedule = {
+def _base_member_schedule(role: str, member: dict, profile: dict) -> dict:
+    return {
         'role': role,
         'destination_id': member['destination_id'],
         'base_destination_id': member['destination_id'],
@@ -115,16 +120,89 @@ def _member_schedule(member: dict, config: dict, rng: np.random.Generator) -> di
         'escort_stop_hours': [],
         'escort_dropoff_destinations': {},
         'escort_pickup_destinations': {},
+        'school_lunch_home_hours': [],
+        'school_presence_hours': [],
     }
 
-    if 'departure' in profile:
-        schedule['departure_hour'] = _sample_gaussian_hour(profile['departure'], rng)
-    if 'return' in profile:
-        schedule['return_hour'] = _sample_gaussian_hour(profile['return'], rng)
-        if schedule['departure_hour'] is not None and schedule['return_hour'] < schedule['departure_hour']:
-            schedule['return_hour'] = schedule['departure_hour']
+
+def _school_hour_probability(values: dict, hour: int, fallback: float = 0.0) -> float:
+    probability = values.get(hour)
+    if probability is None:
+        probability = values.get(str(hour), fallback)
+    return float(np.clip(probability, 0.0, 1.0))
+
+
+def _is_non_internal_destination(destination_id: str | None) -> bool:
+    return destination_id in NON_INTERNAL_DESTINATIONS
+
+
+def _is_outside_destination(destination_id: str | None) -> bool:
+    return destination_id in OUTSIDE_DESTINATIONS
+
+
+def _sample_school_lunch_home_hours(profile: dict, rng: np.random.Generator) -> list[int]:
+    lunch_cfg = profile.get('lunch', {})
+    lunch_hours = [int(hour) for hour in lunch_cfg.get('hours', [])]
+    sampled_hours = []
+    hourly_probabilities = lunch_cfg.get('at_home_probability_by_hour', {})
+    default_probability = float(lunch_cfg.get('at_home_probability', 0.0))
+
+    for hour in lunch_hours:
+        probability = _school_hour_probability(hourly_probabilities, hour, fallback=default_probability)
+        if rng.random() < probability:
+            sampled_hours.append(int(hour))
+    return sorted(set(sampled_hours))
+
+
+def _sample_school_presence_hours(schedule: dict, profile: dict, rng: np.random.Generator) -> list[int]:
+    if (
+        not schedule['enabled']
+        or _is_non_internal_destination(schedule['destination_id'])
+        or schedule['departure_hour'] is None
+        or schedule['return_hour'] is None
+    ):
+        return []
+
+    attendance_probability_by_hour = profile.get('attendance_probability_by_hour', {})
+    school_presence_hours = []
+    for hour in range(int(schedule['departure_hour']), int(schedule['return_hour']) + 1):
+        if hour in schedule.get('school_lunch_home_hours', []):
+            continue
+        probability = _school_hour_probability(attendance_probability_by_hour, hour, fallback=1.0)
+        if rng.random() < probability:
+            school_presence_hours.append(int(hour))
+    return school_presence_hours
+
+
+def _member_schedule(member: dict, config: dict, rng: np.random.Generator) -> dict:
+    role = member['role']
+    profile = _resolve_role_profile(role, config)
+    schedule = _base_member_schedule(role, member, profile)
+
+    schedule['departure_hour'] = _sample_schedule_hour(profile, 'departure', rng)
+    schedule['return_hour'] = _sample_schedule_hour(profile, 'return', rng)
+    _normalize_schedule_time_bounds(schedule)
+
+    if role == SCHOOL_ROLE:
+        schedule['school_lunch_home_hours'] = _sample_school_lunch_home_hours(profile, rng)
+        schedule['school_presence_hours'] = _sample_school_presence_hours(schedule, profile, rng)
 
     return schedule
+
+
+def _sample_schedule_hour(profile: dict, key: str, rng: np.random.Generator) -> int | None:
+    if key not in profile:
+        return None
+    return _sample_gaussian_hour(profile[key], rng)
+
+
+def _normalize_schedule_time_bounds(schedule: dict) -> None:
+    departure_hour = schedule.get('departure_hour')
+    return_hour = schedule.get('return_hour')
+    if departure_hour is None or return_hour is None:
+        return
+    if return_hour < departure_hour:
+        schedule['return_hour'] = departure_hour
 
 
 def _first_destination_for_hour(destinations_by_hour: dict[int, list[str]], hour: int) -> str | None:
@@ -133,7 +211,7 @@ def _first_destination_for_hour(destinations_by_hour: dict[int, list[str]], hour
 
 
 def _register_escort_stop(schedule: dict, hour: int | None, destination_id: str, member_id: str, stop_kind: str) -> None:
-    if hour is None or destination_id in {"DOMICILE", "EXTERIEUR", "None", None}:
+    if hour is None or _is_non_internal_destination(destination_id):
         return
 
     if stop_kind == 'dropoff':
@@ -149,6 +227,83 @@ def _register_escort_stop(schedule: dict, hour: int | None, destination_id: str,
     stop_hours = schedule.setdefault('escort_stop_hours', [])
     if int(hour) not in stop_hours:
         stop_hours.append(int(hour))
+
+
+def _guardian_can_pickup_child(guardian_schedule: dict, child_return: int | None, pickup_overlap_hours: int) -> bool:
+    guardian_role = guardian_schedule.get('role')
+    guardian_return = guardian_schedule.get('return_hour')
+    if guardian_role in {SENIOR_ROLE, 'inactif'}:
+        return True
+    if child_return is None or guardian_return is None:
+        return False
+    return child_return >= (guardian_return - pickup_overlap_hours)
+
+
+def _sync_guardian_departure_with_child(guardian_schedule: dict, child_departure: int | None) -> None:
+    if child_departure is None:
+        return
+    guardian_departure = guardian_schedule.get('departure_hour')
+    if guardian_departure is None:
+        guardian_schedule['departure_hour'] = child_departure
+        return
+    guardian_schedule['departure_hour'] = min(guardian_departure, child_departure)
+
+
+def _school_id_for_child_schedule(child_schedule: dict, building_lookup: pd.DataFrame) -> str | None:
+    school_id = child_schedule.get('destination_id')
+    if _is_non_internal_destination(school_id) or school_id not in building_lookup.index:
+        return None
+    return str(school_id)
+
+
+def _school_distance(home_centroid, school_id: str, building_lookup: pd.DataFrame) -> float:
+    school_centroid = building_lookup.loc[school_id].geometry.centroid
+    return float(home_centroid.distance(school_centroid))
+
+
+def _apply_child_school_constraint(
+    member: dict,
+    child_schedule: dict,
+    guardian_id: str | None,
+    guardian_schedule: dict | None,
+    walk_max_distance: float,
+    pickup_overlap_hours: int,
+    home_centroid,
+    building_lookup: pd.DataFrame,
+) -> None:
+    if not child_schedule.get('enabled', True):
+        child_schedule['school_access_status'] = 'inactive'
+        return
+
+    school_id = _school_id_for_child_schedule(child_schedule, building_lookup)
+    if school_id is None:
+        child_schedule['school_access_status'] = 'outside_commune'
+        return
+
+    distance_m = _school_distance(home_centroid, school_id, building_lookup)
+    child_schedule['school_distance_m'] = round(distance_m, 1)
+
+    if distance_m <= walk_max_distance:
+        child_schedule['escort_mode'] = 'walk'
+        child_schedule['school_access_status'] = 'walk'
+        return
+
+    if guardian_schedule is None or guardian_id is None:
+        child_schedule['escort_mode'] = 'unverified'
+        child_schedule['school_access_status'] = 'unverified_far'
+        return
+
+    child_schedule['escort_mode'] = 'escort'
+    child_schedule['school_access_status'] = 'escort'
+    child_schedule['escort_guardian_id'] = guardian_id
+
+    child_departure = child_schedule.get('departure_hour')
+    child_return = child_schedule.get('return_hour')
+
+    _register_escort_stop(guardian_schedule, child_departure, school_id, member['member_id'], 'dropoff')
+    if _guardian_can_pickup_child(guardian_schedule, child_return, pickup_overlap_hours):
+        _register_escort_stop(guardian_schedule, child_return, school_id, member['member_id'], 'pickup')
+    _sync_guardian_departure_with_child(guardian_schedule, child_departure)
 
 
 def _apply_household_constraints(
@@ -168,61 +323,26 @@ def _apply_household_constraints(
     pickup_overlap_hours = int(household_cfg.get('school_pickup_overlap_hours', 1))
 
     for member in household['members']:
-        if member['role'] != 'scolaire':
+        if member['role'] != SCHOOL_ROLE:
             continue
 
         child_schedule = schedules[member['member_id']]
-        if not child_schedule.get('enabled', True):
-            child_schedule['school_access_status'] = 'inactive'
-            continue
-
-        school_id = child_schedule.get('destination_id')
-        if school_id in {"DOMICILE", "EXTERIEUR", "None", None} or school_id not in building_lookup.index:
-            child_schedule['school_access_status'] = 'outside_commune'
-            continue
-
-        school_centroid = building_lookup.loc[school_id].geometry.centroid
-        distance_m = float(home_centroid.distance(school_centroid))
-        child_schedule['school_distance_m'] = round(distance_m, 1)
-
-        if distance_m <= walk_max_distance:
-            child_schedule['escort_mode'] = 'walk'
-            child_schedule['school_access_status'] = 'walk'
-            continue
-
-        if guardian_schedule is None:
-            child_schedule['escort_mode'] = 'unverified'
-            child_schedule['school_access_status'] = 'unverified_far'
-            continue
-
-        child_schedule['escort_mode'] = 'escort'
-        child_schedule['school_access_status'] = 'escort'
-        child_schedule['escort_guardian_id'] = guardian_id
-
-        child_departure = child_schedule.get('departure_hour')
-        child_return = child_schedule.get('return_hour')
-
-        _register_escort_stop(guardian_schedule, child_departure, school_id, member['member_id'], 'dropoff')
-
-        guardian_role = guardian_schedule.get('role')
-        guardian_return = guardian_schedule.get('return_hour')
-        pickup_possible = guardian_role in {'senior', 'inactif'}
-        if not pickup_possible and child_return is not None and guardian_return is not None:
-            pickup_possible = child_return >= (guardian_return - pickup_overlap_hours)
-        if pickup_possible:
-            _register_escort_stop(guardian_schedule, child_return, school_id, member['member_id'], 'pickup')
-
-        if child_departure is not None:
-            if guardian_schedule.get('departure_hour') is None:
-                guardian_schedule['departure_hour'] = child_departure
-            else:
-                guardian_schedule['departure_hour'] = min(guardian_schedule['departure_hour'], child_departure)
+        _apply_child_school_constraint(
+            member,
+            child_schedule,
+            guardian_id,
+            guardian_schedule,
+            walk_max_distance,
+            pickup_overlap_hours,
+            home_centroid,
+            building_lookup,
+        )
 
 
 def _sample_restaurant_destination(restaurants_by_hour: dict[int, list[str]], hour: int, rng: np.random.Generator) -> str:
     available = restaurants_by_hour.get(hour, [])
     if not available:
-        return "DOMICILE"
+        return HOME_DESTINATION
     return str(rng.choice(available))
 
 
@@ -233,11 +353,11 @@ def _assign_presence(
     destination_id: str,
     hour: int,
 ) -> None:
-    if destination_id == "DOMICILE":
+    if destination_id == HOME_DESTINATION:
         presence_matrix[home_index][hour] += 1
         return
 
-    if destination_id in {"EXTERIEUR", "None", None}:
+    if destination_id in OUTSIDE_DESTINATIONS:
         return
 
     target_index = building_index_by_id.get(str(destination_id))
@@ -245,6 +365,143 @@ def _assign_presence(
         return
 
     presence_matrix[target_index][hour] += 1
+
+
+def _school_destination_for_hour(schedule: dict, hour: int) -> str:
+    if schedule['enabled'] and not _is_non_internal_destination(schedule['destination_id']):
+        if hour in schedule.get('school_presence_hours', []):
+            return schedule['destination_id']
+    return HOME_DESTINATION
+
+
+def _actif_local_destination_for_hour(
+    schedule: dict,
+    profile: dict,
+    hour: int,
+    rng: np.random.Generator,
+    config: dict,
+    restaurants_by_hour: dict[int, list[str]],
+) -> str:
+    destination = HOME_DESTINATION
+    if not schedule['enabled'] or _is_non_internal_destination(schedule['destination_id']):
+        return destination
+    if schedule['departure_hour'] is None or schedule['return_hour'] is None:
+        return destination
+
+    if schedule['departure_hour'] <= hour <= schedule['return_hour']:
+        destination = schedule['destination_id']
+
+    lunch_cfg = profile.get('lunch', {})
+    lunch_hours = lunch_cfg.get('hours', [])
+    if hour not in lunch_hours:
+        return destination
+
+    restaurant_probability = _probability_with_context(
+        float(lunch_cfg.get('at_restaurant_probability', 0.0)),
+        config,
+        'restaurant'
+    )
+    home_probability = float(lunch_cfg.get('at_home_probability', 0.0))
+    draw = rng.random()
+
+    if draw < restaurant_probability:
+        return _sample_restaurant_destination(restaurants_by_hour, hour, rng)
+    if draw < restaurant_probability + home_probability:
+        return HOME_DESTINATION
+    return destination
+
+
+def _actif_navetteur_destination_for_hour(schedule: dict, hour: int) -> str:
+    if schedule['enabled'] and schedule['departure_hour'] is not None and schedule['return_hour'] is not None:
+        if schedule['departure_hour'] <= hour <= schedule['return_hour']:
+            return "EXTERIEUR"
+    return HOME_DESTINATION
+
+
+def _senior_cult_destination(
+    hour: int,
+    rng: np.random.Generator,
+    config: dict,
+    cultes_ids: list[str],
+    scenario_context: dict,
+) -> str | None:
+    sunday_profile = config['temporal_model']['role_profiles'].get(SENIOR_ROLE, {}).get('sunday', {})
+    if not scenario_context.get('religious_day', False):
+        return None
+    if hour not in sunday_profile.get('cult_hours', []):
+        return None
+    cult_probability = _probability_with_context(
+        float(sunday_profile.get('cult_probability', 0.0)),
+        config,
+        'leisure'
+    )
+    if cultes_ids and rng.random() < cult_probability:
+        return str(rng.choice(cultes_ids))
+    return None
+
+
+def _senior_profile_destination(
+    profile: dict,
+    hour: int,
+    rng: np.random.Generator,
+    config: dict,
+    restaurants_by_hour: dict[int, list[str]],
+) -> str | None:
+    if hour in profile.get('market_hours', []):
+        market_probability = _probability_with_context(
+            float(profile.get('market_probability', 0.0)),
+            config,
+            'leisure'
+        )
+        if rng.random() < market_probability:
+            return "EXTERIEUR"
+
+    if hour in profile.get('midday_restaurant_hours', []):
+        restaurant_probability = _probability_with_context(
+            float(profile.get('midday_restaurant_probability', 0.0)),
+            config,
+            'restaurant'
+        )
+        if rng.random() < restaurant_probability:
+            return _sample_restaurant_destination(restaurants_by_hour, hour, rng)
+
+    if hour in profile.get('afternoon_out_hours', []):
+        out_probability = _probability_with_context(
+            float(profile.get('afternoon_out_probability', 0.0)),
+            config,
+            'leisure'
+        )
+        if rng.random() < out_probability:
+            return "EXTERIEUR"
+
+    if hour in profile.get('evening_restaurant_hours', []):
+        restaurant_probability = _probability_with_context(
+            float(profile.get('evening_restaurant_probability', 0.0)),
+            config,
+            'restaurant'
+        )
+        if rng.random() < restaurant_probability:
+            return _sample_restaurant_destination(restaurants_by_hour, hour, rng)
+
+    return None
+
+
+def _senior_destination_for_hour(
+    profile: dict,
+    hour: int,
+    rng: np.random.Generator,
+    config: dict,
+    cultes_ids: list[str],
+    restaurants_by_hour: dict[int, list[str]],
+    scenario_context: dict,
+) -> str:
+    cult_destination = _senior_cult_destination(hour, rng, config, cultes_ids, scenario_context)
+    if cult_destination is not None:
+        return cult_destination
+    profile_destination = _senior_profile_destination(profile, hour, rng, config, restaurants_by_hour)
+    if profile_destination is not None:
+        return profile_destination
+    return HOME_DESTINATION
 
 
 def _destination_for_member_hour(
@@ -266,85 +523,169 @@ def _destination_for_member_hour(
     if escort_pickup is not None:
         return escort_pickup
 
-    destination = "DOMICILE"
+    if role == SCHOOL_ROLE:
+        return _school_destination_for_hour(schedule, hour)
+    if role == LOCAL_WORKER_ROLE:
+        return _actif_local_destination_for_hour(schedule, profile, hour, rng, config, restaurants_by_hour)
+    if role == COMMUTER_ROLE:
+        return _actif_navetteur_destination_for_hour(schedule, hour)
+    if role == SENIOR_ROLE:
+        return _senior_destination_for_hour(profile, hour, rng, config, cultes_ids, restaurants_by_hour, scenario_context)
+    return HOME_DESTINATION
 
-    if role == 'scolaire':
-        if schedule['enabled'] and schedule['destination_id'] not in {"DOMICILE", "EXTERIEUR"}:
-            if schedule['departure_hour'] is not None and schedule['return_hour'] is not None:
-                if schedule['departure_hour'] <= hour <= schedule['return_hour']:
-                    destination = schedule['destination_id']
 
-    elif role == 'actif_local':
-        if schedule['enabled'] and schedule['destination_id'] not in {"DOMICILE", "EXTERIEUR"}:
-            if schedule['departure_hour'] is not None and schedule['return_hour'] is not None:
-                if schedule['departure_hour'] <= hour <= schedule['return_hour']:
-                    destination = schedule['destination_id']
+def _cult_building_ids(df: gpd.GeoDataFrame) -> list[str]:
+    if 'is_culte' not in df.columns:
+        return []
+    return df.loc[df['is_culte'] == True, 'building_id'].astype(str).tolist()
 
-                lunch_cfg = profile.get('lunch', {})
-                lunch_hours = lunch_cfg.get('hours', [])
-                if hour in lunch_hours:
-                    restaurant_probability = _probability_with_context(
-                        float(lunch_cfg.get('at_restaurant_probability', 0.0)),
-                        config,
-                        'restaurant'
-                    )
-                    home_probability = float(lunch_cfg.get('at_home_probability', 0.0))
-                    draw = rng.random()
 
-                    if draw < restaurant_probability:
-                        destination = _sample_restaurant_destination(restaurants_by_hour, hour, rng)
-                    elif draw < restaurant_probability + home_probability:
-                        destination = "DOMICILE"
+def _restaurant_destinations_by_hour(df: gpd.GeoDataFrame) -> dict[int, list[str]]:
+    return {hour: restaurants_ouverts_a_l_heure(df, hour) for hour in range(24)}
 
-    elif role == 'actif_navetteur':
-        if schedule['enabled'] and schedule['departure_hour'] is not None and schedule['return_hour'] is not None:
-            if schedule['departure_hour'] <= hour <= schedule['return_hour']:
-                destination = "EXTERIEUR"
 
-    elif role == 'senior':
-        sunday_profile = config['temporal_model']['role_profiles'].get('senior', {}).get('sunday', {})
-        if scenario_context.get('religious_day', False) and hour in sunday_profile.get('cult_hours', []):
-            cult_probability = _probability_with_context(
-                float(sunday_profile.get('cult_probability', 0.0)),
-                config,
-                'leisure'
+def _building_lookup(df: gpd.GeoDataFrame) -> pd.DataFrame:
+    if 'building_id' not in df.columns:
+        return pd.DataFrame()
+    return df.set_index('building_id')
+
+
+def _household_schedules(household: dict, config: dict, rng: np.random.Generator) -> dict[str, dict]:
+    return {
+        member['member_id']: _member_schedule(member, config, rng)
+        for member in household['members']
+    }
+
+
+def _state_for_destination(destination: str | None) -> str:
+    if destination == HOME_DESTINATION:
+        return "domicile"
+    if _is_outside_destination(destination):
+        return "exterieur"
+    return "interne"
+
+
+def _member_timeline(
+    schedule: dict,
+    rng: np.random.Generator,
+    config: dict,
+    restaurants_by_hour: dict[int, list[str]],
+    cultes_ids: list[str],
+    scenario_context: dict,
+) -> tuple[list[str], list[str]]:
+    role = schedule['role']
+    profile = schedule['profile']
+    destinations: list[str] = []
+    states: list[str] = []
+
+    for hour in range(24):
+        destination = _destination_for_member_hour(
+            role=role,
+            schedule=schedule,
+            profile=profile,
+            hour=hour,
+            rng=rng,
+            config=config,
+            restaurants_by_hour=restaurants_by_hour,
+            cultes_ids=cultes_ids,
+            scenario_context=scenario_context,
+        )
+        destinations.append(destination)
+        states.append(_state_for_destination(destination))
+
+    return destinations, states
+
+
+def _assigned_destination_details(assigned_destination_id: str | None, building_lookup: pd.DataFrame) -> tuple[str, list[float] | None]:
+    if _is_non_internal_destination(assigned_destination_id) or assigned_destination_id not in building_lookup.index:
+        return "", None
+
+    destination_row = building_lookup.loc[assigned_destination_id]
+    centroid = destination_row.geometry.centroid
+    return str(destination_row.get('usage_1', '')), [float(centroid.x), float(centroid.y)]
+
+
+def _member_timeline_row(
+    row,
+    home_index: int,
+    household: dict,
+    member: dict,
+    schedule: dict,
+    timeline: list[str],
+    states: list[str],
+    building_lookup: pd.DataFrame,
+) -> dict:
+    assigned_destination_id = schedule['destination_id']
+    assigned_destination_usage, assigned_destination_centroid = _assigned_destination_details(
+        assigned_destination_id,
+        building_lookup,
+    )
+    home_centroid = row.geometry.centroid
+    return {
+        'home_index': home_index,
+        'home_building_id': row['building_id'],
+        'household_id': household.get('household_id'),
+        'member_id': member['member_id'],
+        'role': schedule['role'],
+        'assigned_destination_id': assigned_destination_id,
+        'assigned_destination_usage': assigned_destination_usage,
+        'escort_mode': schedule.get('escort_mode', 'none'),
+        'school_access_status': schedule.get('school_access_status', 'not_applicable'),
+        'school_distance_m': schedule.get('school_distance_m'),
+        'escort_guardian_id': schedule.get('escort_guardian_id'),
+        'escort_child_ids': list(schedule.get('escort_child_ids', [])),
+        'escort_stop_hours': sorted(schedule.get('escort_stop_hours', [])),
+        'timeline_destinations': timeline,
+        'timeline_states': states,
+        'origin_centroid': [float(home_centroid.x), float(home_centroid.y)],
+        'assigned_destination_centroid': assigned_destination_centroid,
+    }
+
+
+def _timeline_rows_for_household(
+    row,
+    home_index: int,
+    household: dict,
+    config: dict,
+    rng: np.random.Generator,
+    building_lookup: pd.DataFrame,
+    restaurants_by_hour: dict[int, list[str]],
+    cultes_ids: list[str],
+    scenario_context: dict,
+) -> list[dict]:
+    schedules = _household_schedules(household, config, rng)
+    _apply_household_constraints(
+        household,
+        schedules,
+        config,
+        row.geometry.centroid,
+        building_lookup,
+    )
+
+    rows: list[dict] = []
+    for member in household['members']:
+        schedule = schedules[member['member_id']]
+        timeline, states = _member_timeline(
+            schedule,
+            rng,
+            config,
+            restaurants_by_hour,
+            cultes_ids,
+            scenario_context,
+        )
+        rows.append(
+            _member_timeline_row(
+                row,
+                home_index,
+                household,
+                member,
+                schedule,
+                timeline,
+                states,
+                building_lookup,
             )
-            if cultes_ids and rng.random() < cult_probability:
-                destination = str(rng.choice(cultes_ids))
-        elif hour in profile.get('market_hours', []):
-            market_probability = _probability_with_context(
-                float(profile.get('market_probability', 0.0)),
-                config,
-                'leisure'
-            )
-            if rng.random() < market_probability:
-                destination = "EXTERIEUR"
-        elif hour in profile.get('midday_restaurant_hours', []):
-            restaurant_probability = _probability_with_context(
-                float(profile.get('midday_restaurant_probability', 0.0)),
-                config,
-                'restaurant'
-            )
-            if rng.random() < restaurant_probability:
-                destination = _sample_restaurant_destination(restaurants_by_hour, hour, rng)
-        elif hour in profile.get('afternoon_out_hours', []):
-            out_probability = _probability_with_context(
-                float(profile.get('afternoon_out_probability', 0.0)),
-                config,
-                'leisure'
-            )
-            if rng.random() < out_probability:
-                destination = "EXTERIEUR"
-        elif hour in profile.get('evening_restaurant_hours', []):
-            restaurant_probability = _probability_with_context(
-                float(profile.get('evening_restaurant_probability', 0.0)),
-                config,
-                'restaurant'
-            )
-            if rng.random() < restaurant_probability:
-                destination = _sample_restaurant_destination(restaurants_by_hour, hour, rng)
-
-    return destination
+        )
+    return rows
 
 
 def build_member_timelines(df_batiments: gpd.GeoDataFrame, config: dict) -> pd.DataFrame:
@@ -353,10 +694,10 @@ def build_member_timelines(df_batiments: gpd.GeoDataFrame, config: dict) -> pd.D
     """
     df = df_batiments.copy()
     rng = build_rng(config, "temporal")
-    cultes_ids = df.loc[df.get('is_culte', False) == True, 'building_id'].astype(str).tolist() if 'is_culte' in df.columns else []
-    restaurants_by_hour = {hour: restaurants_ouverts_a_l_heure(df, hour) for hour in range(24)}
+    cultes_ids = _cult_building_ids(df)
+    restaurants_by_hour = _restaurant_destinations_by_hour(df)
     scenario_context = _scenario_modifiers(config)
-    building_lookup = df.set_index('building_id') if 'building_id' in df.columns else pd.DataFrame()
+    building_lookup = _building_lookup(df)
 
     rows: list[dict] = []
     for idx, row in df.iterrows():
@@ -365,76 +706,19 @@ def build_member_timelines(df_batiments: gpd.GeoDataFrame, config: dict) -> pd.D
             continue
 
         for household in households:
-            schedules = {
-                member['member_id']: _member_schedule(member, config, rng)
-                for member in household['members']
-            }
-            _apply_household_constraints(
-                household,
-                schedules,
-                config,
-                row.geometry.centroid,
-                building_lookup,
-            )
-
-            for member in household['members']:
-                schedule = schedules[member['member_id']]
-                role = schedule['role']
-                profile = schedule['profile']
-                timeline = []
-                states = []
-
-                for hour in range(24):
-                    destination = _destination_for_member_hour(
-                        role=role,
-                        schedule=schedule,
-                        profile=profile,
-                        hour=hour,
-                        rng=rng,
-                        config=config,
-                        restaurants_by_hour=restaurants_by_hour,
-                        cultes_ids=cultes_ids,
-                        scenario_context=scenario_context,
-                    )
-                    timeline.append(destination)
-                    if destination == "DOMICILE":
-                        states.append("domicile")
-                    elif destination in {"EXTERIEUR", "None", None}:
-                        states.append("exterieur")
-                    else:
-                        states.append("interne")
-
-                assigned_destination_id = schedule['destination_id']
-                assigned_destination_usage = ""
-                assigned_destination_centroid = None
-                if assigned_destination_id not in {"DOMICILE", "EXTERIEUR", "None", None} and assigned_destination_id in building_lookup.index:
-                    destination_row = building_lookup.loc[assigned_destination_id]
-                    assigned_destination_usage = str(destination_row.get('usage_1', ''))
-                    centroid = destination_row.geometry.centroid
-                    assigned_destination_centroid = [float(centroid.x), float(centroid.y)]
-
-                home_centroid = row.geometry.centroid
-                rows.append(
-                    {
-                        'home_index': idx,
-                        'home_building_id': row['building_id'],
-                        'household_id': household.get('household_id'),
-                        'member_id': member['member_id'],
-                        'role': role,
-                        'assigned_destination_id': assigned_destination_id,
-                        'assigned_destination_usage': assigned_destination_usage,
-                        'escort_mode': schedule.get('escort_mode', 'none'),
-                        'school_access_status': schedule.get('school_access_status', 'not_applicable'),
-                        'school_distance_m': schedule.get('school_distance_m'),
-                        'escort_guardian_id': schedule.get('escort_guardian_id'),
-                        'escort_child_ids': list(schedule.get('escort_child_ids', [])),
-                        'escort_stop_hours': sorted(schedule.get('escort_stop_hours', [])),
-                        'timeline_destinations': timeline,
-                        'timeline_states': states,
-                        'origin_centroid': [float(home_centroid.x), float(home_centroid.y)],
-                        'assigned_destination_centroid': assigned_destination_centroid,
-                    }
+            rows.extend(
+                _timeline_rows_for_household(
+                    row,
+                    idx,
+                    household,
+                    config,
+                    rng,
+                    building_lookup,
+                    restaurants_by_hour,
+                    cultes_ids,
+                    scenario_context,
                 )
+            )
 
     return pd.DataFrame(rows)
 
@@ -500,6 +784,39 @@ def _apply_activity_population(df: gpd.GeoDataFrame, config: dict) -> gpd.GeoDat
     return df
 
 
+def _initialize_hourly_population_columns(df: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    for hour in range(24):
+        df[f'pop_h{hour}'] = 0
+    return df
+
+
+def _empty_presence_matrix(df: gpd.GeoDataFrame) -> dict[int, np.ndarray]:
+    return {idx: np.zeros(24) for idx in df.index}
+
+
+def _apply_member_timelines_to_presence(
+    presence_matrix: dict[int, np.ndarray],
+    member_timelines: pd.DataFrame,
+    building_index_by_id: dict[str, int],
+) -> None:
+    for _, member_row in member_timelines.iterrows():
+        for hour, destination in enumerate(member_row['timeline_destinations']):
+            _assign_presence(
+                presence_matrix,
+                building_index_by_id,
+                int(member_row['home_index']),
+                destination,
+                hour,
+            )
+
+
+def _write_presence_matrix(df: gpd.GeoDataFrame, presence_matrix: dict[int, np.ndarray]) -> gpd.GeoDataFrame:
+    for idx, presence in presence_matrix.items():
+        for hour in range(24):
+            df.at[idx, f'pop_h{hour}'] = int(presence[hour])
+    return df
+
+
 def generer_matrice_horaire(df_batiments: gpd.GeoDataFrame, config: dict) -> gpd.GeoDataFrame:
     """
     Calcule la population présente dans chaque bâtiment pour chaque heure.
@@ -516,26 +833,11 @@ def generer_matrice_horaire(df_batiments: gpd.GeoDataFrame, config: dict) -> gpd
 
     df = df_batiments.copy()
     building_index_by_id = {str(row['building_id']): idx for idx, row in df.iterrows()}
-
-    for h in range(24):
-        df[f'pop_h{h}'] = 0
-
-    presence_matrix = {idx: np.zeros(24) for idx in df.index}
+    df = _initialize_hourly_population_columns(df)
+    presence_matrix = _empty_presence_matrix(df)
     member_timelines = build_member_timelines(df, config)
-    for _, member_row in member_timelines.iterrows():
-        for hour, destination in enumerate(member_row['timeline_destinations']):
-            _assign_presence(
-                presence_matrix,
-                building_index_by_id,
-                int(member_row['home_index']),
-                destination,
-                hour,
-            )
-
-    for idx, presence in presence_matrix.items():
-        for h in range(24):
-            df.at[idx, f'pop_h{h}'] = int(presence[h])
-
+    _apply_member_timelines_to_presence(presence_matrix, member_timelines, building_index_by_id)
+    df = _write_presence_matrix(df, presence_matrix)
     df = _apply_activity_population(df, config)
     df = _apply_beach_population(df, config)
 

@@ -10,6 +10,20 @@
             </Attribute>
           </value>
         </entry>
+        <entry key="/data/04_visualization/proxy_validation_refactor_smoke/proxy_validation_curves.csv">
+          <value>
+            <Attribute>
+              <option name="separator" value="," />
+            </Attribute>
+          </value>
+        </entry>
+        <entry key="/data/04_visualization/proxy_validation_temporal_refactor/proxy_validation_summary.csv">
+          <value>
+            <Attribute>
+              <option name="separator" value="," />
+            </Attribute>
+          </value>
+        </entry>
       </map>
     </option>
   </component>

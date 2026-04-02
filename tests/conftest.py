@@ -1,5 +1,4 @@
 import pytest
-import yaml
 import geopandas as gpd
 from src.io.loaders import load_geopackage_with_mask, load_study_area_boundary
 from src.core.geometry import filter_buildings_by_area, compute_centroids
@@ -7,13 +6,12 @@ from src.core.identifiers import assign_building_ids
 from src.core.spatial_join import join_buildings_to_grid
 from src.core.downscaling import ventiler_population_residentielle
 from src.core.cleaning import clip_to_strict_boundary
-from src.pipeline import run_pipeline
+from src.pipeline import load_config, run_pipeline
 
 
 @pytest.fixture(scope="session")
 def config():
-    with open("config.yaml", 'r', encoding='utf-8') as f:
-        return yaml.safe_load(f)
+    return load_config("config.yaml")
 
 
 @pytest.fixture(scope="session")

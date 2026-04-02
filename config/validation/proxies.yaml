@@ -1,0 +1,202 @@
+# =============================================================================
+# VALIDATION TEMPORELLE PAR PROXYS
+# =============================================================================
+# Ce fichier greffe au socle commun :
+# - les jeux de scénarios de comparaison ;
+# - les courbes de référence publiques ou documentées ;
+# - les seuils d'acceptation des proxys.
+extends: ../base.yaml
+
+proxy_validation:
+  scenario_sets:
+    default:
+      - config_path: "../scenarios/weekday_school_day.yaml"
+        label: "jour_ouvre_hors_vacances"
+      - config_path: "../scenarios/summer_day.yaml"
+        label: "ete_jour_vacances"
+    storm_baseline:
+      - config_path: "../scenarios/xynthia_winter_night.yaml"
+        label: "hiver_nuit"
+    scenario_contrast:
+      - config_path: "../scenarios/weekday_school_day.yaml"
+        label: "jour_ouvre_hors_vacances"
+      - config_path: "../scenarios/summer_day.yaml"
+        label: "ete_jour_vacances"
+      - config_path: "../scenarios/xynthia_winter_night.yaml"
+        label: "hiver_nuit"
+
+  temporal_proxies:
+    - proxy_id: "navetteurs_hors_commune_weekday"
+      label: "Navetteurs hors commune en jour ouvre"
+      metric: "role_state_share"
+      role: "actif_navetteur"
+      state: "exterieur"
+      comparison_normalization: "none"
+      reference_curve:
+        0: 0.00
+        1: 0.00
+        2: 0.00
+        3: 0.00
+        4: 0.00
+        5: 0.05
+        6: 0.20
+        7: 0.55
+        8: 0.85
+        9: 1.00
+        10: 1.00
+        11: 1.00
+        12: 1.00
+        13: 1.00
+        14: 1.00
+        15: 1.00
+        16: 1.00
+        17: 0.85
+        18: 0.45
+        19: 0.15
+        20: 0.02
+        21: 0.00
+        22: 0.00
+        23: 0.00
+      applicability:
+        day_types:
+          - "weekday"
+      thresholds:
+        correlation_pass_min: 0.85
+        correlation_warn_min: 0.65
+        rmse_pass_max: 0.12
+        rmse_warn_max: 0.22
+        peak_gap_pass_max_hours: 1
+        peak_gap_warn_max_hours: 2
+      evidence:
+        formula: "Part_navetteurs_exterieur(t) = f(heures de pointe domicile-travail)"
+        source_name: "Insee RP2022 ACT T4 + GTFS Destineo Pays de la Loire"
+        source_type: "open_data_plus_inference"
+        source_url: "https://transport.data.gouv.fr/resources/79818"
+        source_url_secondary: "https://www.insee.fr/fr/statistiques/2011101?geo=COM-44010"
+        source_file: ""
+        extraction_date: "2026-03-24"
+        spatial_scope: "Batz-sur-Mer et bassin de deplacement proche"
+        temporal_scope: "Jour ouvre type"
+        unit: "part des navetteurs hors commune"
+        extraction_method: "Courbe horaire inferee a partir du profil de pointes domicile-travail et du GTFS regional public"
+        processing_note: "L'Insee documente que 73,0% des actifs occupes residents travaillent hors commune en 2022 ; le GTFS sert a fixer les fenetres de pointe du proxy, pas a mesurer directement les individus."
+        confidence: "medium"
+        uncertainty_note: "Proxy de forme horaire, non un comptage direct. A raffiner avec observations routieres ou comptages locaux."
+
+    - proxy_id: "scolaires_presence_interne_weekday"
+      label: "Presence scolaire interne hors vacances"
+      metric: "role_internal_assigned_state_share"
+      role: "scolaire"
+      state: "interne"
+      comparison_normalization: "none"
+      reference_curve:
+        0: 0.00
+        1: 0.00
+        2: 0.00
+        3: 0.00
+        4: 0.00
+        5: 0.00
+        6: 0.00
+        7: 0.00
+        8: 0.35
+        9: 1.00
+        10: 1.00
+        11: 0.95
+        12: 0.05
+        13: 0.15
+        14: 1.00
+        15: 1.00
+        16: 0.55
+        17: 0.00
+        18: 0.00
+        19: 0.00
+        20: 0.00
+        21: 0.00
+        22: 0.00
+        23: 0.00
+      applicability:
+        day_types:
+          - "weekday"
+        school_holidays:
+          - false
+      thresholds:
+        correlation_pass_min: 0.85
+        correlation_warn_min: 0.65
+        rmse_pass_max: 0.14
+        rmse_warn_max: 0.24
+        peak_gap_pass_max_hours: 1
+        peak_gap_warn_max_hours: 2
+      evidence:
+        formula: "Part_scolaires_internes(t) = f(horaires d'ouverture des ecoles locales)"
+        source_name: "Horaires publics des ecoles Alain Boutle et Sainte-Marie Saint-Pierre"
+        source_type: "public_local_schedule"
+        source_url: "https://www.journaldesfemmes.fr/maman/ecole/ecole-primaire-alain-boutle/primaire-0440446W"
+        source_url_secondary: "https://www.journaldesfemmes.fr/maman/ecole/ecole-privee-ste-marie-st-pierre/primaire-0441571K"
+        source_file: ""
+        extraction_date: "2026-03-24"
+        spatial_scope: "Batz-sur-Mer"
+        temporal_scope: "Jour scolaire type"
+        unit: "part des scolaires modelises en presence interne"
+        extraction_method: "Reconstruction horaire a partir des amplitudes publiques de cours, avec creux meridien."
+        processing_note: "Le proxy vise la forme horaire d'occupation scolaire, pas un effectif instantane exact."
+        confidence: "medium"
+        uncertainty_note: "Les horaires peuvent varier selon classe, garderie, restauration et activites periscolaires."
+
+    - proxy_id: "presence_enseignement_batiments_weekday"
+      label: "Charge relative des batiments d'enseignement"
+      metric: "building_usage_count"
+      usage_any_of:
+        - "Enseignement"
+      comparison_normalization: "max"
+      reference_curve:
+        0: 0.00
+        1: 0.00
+        2: 0.00
+        3: 0.00
+        4: 0.00
+        5: 0.00
+        6: 0.00
+        7: 0.00
+        8: 0.35
+        9: 1.00
+        10: 1.00
+        11: 0.95
+        12: 0.05
+        13: 0.15
+        14: 1.00
+        15: 1.00
+        16: 0.55
+        17: 0.00
+        18: 0.00
+        19: 0.00
+        20: 0.00
+        21: 0.00
+        22: 0.00
+        23: 0.00
+      applicability:
+        day_types:
+          - "weekday"
+        school_holidays:
+          - false
+      thresholds:
+        correlation_pass_min: 0.80
+        correlation_warn_min: 0.60
+        rmse_pass_max: 0.16
+        rmse_warn_max: 0.26
+        peak_gap_pass_max_hours: 1
+        peak_gap_warn_max_hours: 2
+      evidence:
+        formula: "Charge_enseignement(t) ~ f(horaires d'ouverture des ecoles)"
+        source_name: "Horaires publics des ecoles locales, compares a la charge relative des batiments Enseignement"
+        source_type: "public_local_schedule"
+        source_url: "https://www.journaldesfemmes.fr/maman/ecole/ecole-primaire-alain-boutle/primaire-0440446W"
+        source_url_secondary: "https://www.journaldesfemmes.fr/maman/ecole/ecole-privee-ste-marie-st-pierre/primaire-0441571K"
+        source_file: ""
+        extraction_date: "2026-03-24"
+        spatial_scope: "Batz-sur-Mer"
+        temporal_scope: "Jour scolaire type"
+        unit: "courbe normalisee"
+        extraction_method: "Normalisation max de la courbe de reference pour comparer la forme et l'heure de pic."
+        processing_note: "Ce proxy valide la respiration temporelle des batiments d'enseignement plutot qu'un nombre absolu d'eleves."
+        confidence: "medium"
+        uncertainty_note: "Le signal peut etre dilue si d'autres usages ou populations cohabitent dans les memes emprises."

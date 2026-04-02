@@ -1,0 +1,28 @@
+# =============================================================================
+# SCÉNARIO : JOUR OUVRÉ HORS VACANCES
+# =============================================================================
+extends: ../validation/proxies.yaml
+
+scenario:
+  name: "weekday_school_day_public_validation"
+  day_of_week: "Jeudi"
+  is_school_holiday: false
+  reference_hour: 14
+  residences:
+    r_rp: 0.355
+    r_rs: 0.611
+    tau_saison: 0.25
+    alpha_domicile: 0.62
+  commerce:
+    sqm_per_employee: 30
+    client_employee_ratio: 4
+    alpha_commerce: 0.0
+  tourisme:
+    tau_meteo: 0.5
+    alpha_plage: 0.0
+    tau_occupation_lits: 0.20
+  temporal_context:
+    season: "spring"
+    weather_index: 0.6
+    alert_level: 0.0
+    religious_day: false

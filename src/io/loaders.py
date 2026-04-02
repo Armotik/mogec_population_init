@@ -44,6 +44,56 @@ def get_study_area_boundary(commune_name: str, target_crs: int = 2154, buffer_m:
         raise
 
 
+def _boundary_name_value(study_area: dict) -> str:
+    configured_value = study_area.get('boundary_name_value')
+    if configured_value:
+        return str(configured_value)
+    return study_area['commune_name'].split(",")[0].strip()
+
+
+def _apply_boundary_buffer(boundary: gpd.GeoDataFrame, buffer_m: int) -> gpd.GeoDataFrame:
+    if buffer_m <= 0:
+        return boundary
+    boundary = boundary.copy()
+    boundary['geometry'] = boundary.geometry.buffer(buffer_m)
+    return boundary
+
+
+def _load_local_boundary(study_area: dict, target_crs: int, buffer_m: int) -> gpd.GeoDataFrame | None:
+    boundary_path = study_area.get('boundary_path')
+    if not boundary_path:
+        return None
+
+    path = Path(boundary_path)
+    if not path.exists():
+        logger.warning(
+            "Fichier de frontière introuvable : %s ; repli vers le geocodage OSM.",
+            boundary_path,
+        )
+        return None
+
+    boundary_layer = study_area.get('boundary_layer', 'commune')
+    boundary_name_field = study_area.get('boundary_name_field', 'libelle_commune')
+    boundary_name_value = _boundary_name_value(study_area)
+
+    logger.info(f"Chargement de la frontière locale '{boundary_name_value}' depuis {path.name}...")
+    boundary = gpd.read_file(path, layer=boundary_layer)
+    mask = boundary[boundary_name_field].fillna("").str.casefold() == boundary_name_value.casefold()
+    boundary = boundary.loc[mask].copy()
+
+    if boundary.empty:
+        logger.warning(
+            "Aucune entité trouvée pour '%s' dans %s.%s ; repli vers le geocodage OSM.",
+            boundary_name_value,
+            boundary_layer,
+            boundary_name_field,
+        )
+        return None
+
+    boundary = boundary.to_crs(epsg=target_crs)
+    return _apply_boundary_buffer(boundary, buffer_m)
+
+
 def load_study_area_boundary(config: dict, strict: bool = False) -> gpd.GeoDataFrame:
     """
     Charge la frontière d'étude depuis une source locale si elle est configurée.
@@ -61,33 +111,17 @@ def load_study_area_boundary(config: dict, strict: bool = False) -> gpd.GeoDataF
     study_area = config['study_area']
     target_crs = config['project']['crs_epsg']
     buffer_m = 0 if strict else study_area.get('buffer_m', 0)
-    boundary_path = study_area.get('boundary_path')
-
-    if boundary_path:
-        path = Path(boundary_path)
-        if not path.exists():
-            raise FileNotFoundError(f"Fichier de frontière introuvable : {boundary_path}")
-
-        boundary_layer = study_area.get('boundary_layer', 'commune')
-        boundary_name_field = study_area.get('boundary_name_field', 'libelle_commune')
-        boundary_name_value = study_area.get('boundary_name_value') or study_area['commune_name'].split(",")[0].strip()
-
-        logger.info(f"Chargement de la frontière locale '{boundary_name_value}' depuis {path.name}...")
-        boundary = gpd.read_file(path, layer=boundary_layer)
-        mask = boundary[boundary_name_field].fillna("").str.casefold() == boundary_name_value.casefold()
-        boundary = boundary.loc[mask].copy()
-
-        if boundary.empty:
-            raise ValueError(
-                f"Aucune entité trouvée pour '{boundary_name_value}' dans {boundary_layer}.{boundary_name_field}"
-            )
-
-        boundary = boundary.to_crs(epsg=target_crs)
-        if buffer_m > 0:
-            boundary['geometry'] = boundary.geometry.buffer(buffer_m)
-        return boundary
-
+    local_boundary = _load_local_boundary(study_area, target_crs, buffer_m)
+    if local_boundary is not None:
+        return local_boundary
     return get_study_area_boundary(study_area['commune_name'], target_crs, buffer_m=buffer_m)
+
+
+def _validate_mask(mask_gdf: gpd.GeoDataFrame) -> None:
+    if mask_gdf.empty:
+        raise ValueError("Le masque spatial fourni est vide.")
+    if mask_gdf.crs is None:
+        raise ValueError("Le masque spatial doit avoir un CRS défini.")
 
 
 def load_geopackage_with_mask(file_path: str, layer_name: str, mask_gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
@@ -100,6 +134,7 @@ def load_geopackage_with_mask(file_path: str, layer_name: str, mask_gdf: gpd.Geo
     path = Path(file_path)
     if not path.exists():
         raise FileNotFoundError(f"Fichier introuvable : {file_path}")
+    _validate_mask(mask_gdf)
 
     logger.info(f"Chargement de la couche '{layer_name}' depuis {path.name} avec masque spatial...")
 

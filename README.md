@@ -181,6 +181,12 @@ Un script autonome permet de générer un dossier de validation réutilisable ho
 ./.venv/bin/python scripts/generate_scientific_validation.py --config config.yaml
 ```
 
+Pour comparer plusieurs scenarios a des courbes de reference publiques ou documentees :
+
+```bash
+./.venv/bin/python scripts/run_proxy_validation.py --config config.yaml
+```
+
 Un second script génère un explorateur HTML autonome pour visualiser les profils, leurs activités et suivre un individu heure par heure :
 
 ```bash
@@ -200,6 +206,8 @@ Voir aussi :
 
 - `docs/validation_scientifique.md`
   Cadre méthodologique détaillé pour distinguer cohérence interne, traçabilité des hypothèses et confrontation externe.
+- `docs/proxy_validation.md`
+  Mise en place d'une validation temporelle par proxys, sur un ou plusieurs scénarios.
 - `docs/exploration_profils.md`
   Mode d'emploi des explorateurs de profils, en HTML autonome ou en serveur web local, pour filtrer un rôle, suivre un agent ou un foyer et lire les activités simulées dans le temps.
 

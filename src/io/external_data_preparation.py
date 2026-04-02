@@ -25,6 +25,9 @@ from src.core.identifiers import assign_building_ids
 from src.io.loaders import load_geopackage_with_mask, load_study_area_boundary
 
 logger = logging.getLogger(__name__)
+EMPTY_TOURISM_COLUMNS = ["dataset_type", "offer_name", "geometry"]
+ACCOMMODATION_DATASET_TYPES = ["hotel", "camping", "residence", "collective", "locative"]
+EMPTY_CAPACITY_COLUMNS = ["building_id", "capacity_lits"]
 
 
 TOURISM_SPECS = {
@@ -146,6 +149,14 @@ def _read_tourism_csv(path: Path) -> pd.DataFrame:
     return pd.read_csv(path, sep=";")
 
 
+def _empty_tourism_gdf() -> gpd.GeoDataFrame:
+    return gpd.GeoDataFrame(columns=EMPTY_TOURISM_COLUMNS, geometry="geometry", crs="EPSG:4326")
+
+
+def _empty_capacity_table() -> pd.DataFrame:
+    return pd.DataFrame(columns=EMPTY_CAPACITY_COLUMNS)
+
+
 def _filter_to_commune(df: pd.DataFrame, commune_col: str, insee_col: str, config: dict) -> pd.DataFrame:
     commune_name, commune_insee = _get_commune_filters(config)
     commune_mask = df[commune_col].fillna("").apply(_normalise_commune_key) == commune_name
@@ -169,7 +180,7 @@ def _harmonise_tourism_dataset(dataset_name: str, path: Path, config: dict) -> g
     df = _filter_to_commune(df, spec["commune_col"], spec["insee_col"], config)
 
     if df.empty:
-        return gpd.GeoDataFrame(columns=["dataset_type", "offer_name", "geometry"], geometry="geometry", crs="EPSG:4326")
+        return _empty_tourism_gdf()
 
     result = pd.DataFrame(
         {
@@ -225,7 +236,7 @@ def load_and_harmonise_tourism_offers(config: dict) -> gpd.GeoDataFrame:
         frames.append(_harmonise_tourism_dataset(dataset_name, path, config))
 
     if not frames:
-        return gpd.GeoDataFrame(columns=["dataset_type", "offer_name", "geometry"], geometry="geometry", crs="EPSG:4326")
+        return _empty_tourism_gdf()
 
     tourism = pd.concat(frames, ignore_index=True)
     tourism = gpd.GeoDataFrame(tourism, geometry="geometry", crs="EPSG:4326")
@@ -352,6 +363,20 @@ def _derive_capacity_lits(row: pd.Series, config: dict) -> tuple[float, str]:
     return 0.0, "missing_capacity"
 
 
+def _derive_accommodation_capacities(accommodation: pd.DataFrame, config: dict) -> pd.DataFrame:
+    if accommodation.empty:
+        return accommodation
+
+    accommodation = accommodation.copy()
+    accommodation["capacity_lits"] = 0.0
+    accommodation["capacity_method"] = "missing_capacity"
+    for index, row in accommodation.iterrows():
+        capacity, method = _derive_capacity_lits(row, config)
+        accommodation.at[index, "capacity_lits"] = capacity
+        accommodation.at[index, "capacity_method"] = method
+    return accommodation[accommodation["capacity_lits"] > 0].copy()
+
+
 def _load_buildings_for_matching(config: dict) -> gpd.GeoDataFrame:
     boundary = load_study_area_boundary(config, strict=True)
     bati = load_geopackage_with_mask(
@@ -393,31 +418,12 @@ def _select_candidate_building(
     return best
 
 
-def prepare_accommodation_capacity_table(tourism_gdf: gpd.GeoDataFrame, config: dict) -> pd.DataFrame:
-    """
-    Construit une table de capacite d'hebergement jointe au bati par `building_id`.
-    """
-    logger.info("Preparation de la table de capacite d'hebergement...")
-    accommodation = tourism_gdf[tourism_gdf["dataset_type"].isin(["hotel", "camping", "residence", "collective", "locative"])].copy()
-    if accommodation.empty:
-        return pd.DataFrame(columns=["building_id", "capacity_lits"])
-
-    accommodation["capacity_lits"] = 0.0
-    accommodation["capacity_method"] = "missing_capacity"
-    for index, row in accommodation.iterrows():
-        capacity, method = _derive_capacity_lits(row, config)
-        accommodation.at[index, "capacity_lits"] = capacity
-        accommodation.at[index, "capacity_method"] = method
-
-    accommodation = accommodation[accommodation["capacity_lits"] > 0].copy()
-    if accommodation.empty:
-        return pd.DataFrame(columns=["building_id", "capacity_lits"])
-
-    buildings = _load_buildings_for_matching(config)
-    matching_cfg = config.get("external_preparation", {}).get("accommodation", {})
-    max_distance_m = float(matching_cfg.get("match_max_distance_m", 120.0))
-    preferred_usage = matching_cfg.get("preferred_usage_any_of", [])
-
+def _matched_accommodation_rows(
+    accommodation: pd.DataFrame,
+    buildings: gpd.GeoDataFrame,
+    max_distance_m: float,
+    preferred_usage: list[str],
+) -> list[dict]:
     matched_rows: list[dict] = []
     for _, row in accommodation.iterrows():
         best_building = _select_candidate_building(buildings, row.geometry, max_distance_m, preferred_usage)
@@ -437,11 +443,10 @@ def prepare_accommodation_capacity_table(tourism_gdf: gpd.GeoDataFrame, config: 
                 "website": row["website"],
             }
         )
+    return matched_rows
 
-    matched = pd.DataFrame(matched_rows)
-    if matched.empty:
-        return pd.DataFrame(columns=["building_id", "capacity_lits"])
 
+def _aggregate_matched_accommodation(matched: pd.DataFrame) -> pd.DataFrame:
     aggregated = (
         matched.groupby("building_id", as_index=False)
         .agg(
@@ -454,6 +459,33 @@ def prepare_accommodation_capacity_table(tourism_gdf: gpd.GeoDataFrame, config: 
         )
     )
     aggregated["capacity_lits"] = aggregated["capacity_lits"].round().astype(int)
+    return aggregated
+
+
+def prepare_accommodation_capacity_table(tourism_gdf: gpd.GeoDataFrame, config: dict) -> pd.DataFrame:
+    """
+    Construit une table de capacite d'hebergement jointe au bati par `building_id`.
+    """
+    logger.info("Preparation de la table de capacite d'hebergement...")
+    accommodation = tourism_gdf[tourism_gdf["dataset_type"].isin(ACCOMMODATION_DATASET_TYPES)].copy()
+    if accommodation.empty:
+        return _empty_capacity_table()
+
+    accommodation = _derive_accommodation_capacities(accommodation, config)
+    if accommodation.empty:
+        return _empty_capacity_table()
+
+    buildings = _load_buildings_for_matching(config)
+    matching_cfg = config.get("external_preparation", {}).get("accommodation", {})
+    max_distance_m = float(matching_cfg.get("match_max_distance_m", 120.0))
+    preferred_usage = matching_cfg.get("preferred_usage_any_of", [])
+
+    matched_rows = _matched_accommodation_rows(accommodation, buildings, max_distance_m, preferred_usage)
+    matched = pd.DataFrame(matched_rows)
+    if matched.empty:
+        return _empty_capacity_table()
+
+    aggregated = _aggregate_matched_accommodation(matched)
     logger.info("%s batiments d'hebergement prepares avec capacite.", len(aggregated))
     return aggregated
 
@@ -516,6 +548,30 @@ def _official_value(official_summary: pd.DataFrame, activity_code: str, tour_mea
     return float(value)
 
 
+def _calibration_row(
+    parameter_name: str,
+    dataset_type: str,
+    current_value: float,
+    recommended_value: float,
+    local_reference: float,
+    official_reference: float,
+    official_activity_code: str,
+    official_measure: str,
+    method_note: str,
+) -> dict:
+    return {
+        "parameter_name": parameter_name,
+        "dataset_type": dataset_type,
+        "current_value": current_value,
+        "recommended_value": recommended_value,
+        "local_reference": local_reference,
+        "official_reference": official_reference,
+        "official_activity_code": official_activity_code,
+        "official_measure": official_measure,
+        "method_note": method_note,
+    }
+
+
 def prepare_accommodation_calibration(tourism_gdf: gpd.GeoDataFrame, config: dict) -> pd.DataFrame:
     """
     Produit des recommandations de calibration a partir des references Insee.
@@ -535,17 +591,17 @@ def prepare_accommodation_calibration(tourism_gdf: gpd.GeoDataFrame, config: dic
     hotel_official = _official_value(official, "I551", "PLACE")
     if hotel_rooms > 0 and hotel_official is not None:
         rows.append(
-            {
-                "parameter_name": "hotel_beds_per_room",
-                "dataset_type": "hotel",
-                "current_value": float(rules.get("hotel_beds_per_room", 2.0)),
-                "recommended_value": round(hotel_official / hotel_rooms, 3),
-                "local_reference": float(hotel_rooms),
-                "official_reference": hotel_official,
-                "official_activity_code": "I551",
-                "official_measure": "PLACE",
-                "method_note": "Rapport entre les places Insee hotelieres et le nombre local de chambres declarees.",
-            }
+            _calibration_row(
+                "hotel_beds_per_room",
+                "hotel",
+                float(rules.get("hotel_beds_per_room", 2.0)),
+                round(hotel_official / hotel_rooms, 3),
+                float(hotel_rooms),
+                hotel_official,
+                "I551",
+                "PLACE",
+                "Rapport entre les places Insee hotelieres et le nombre local de chambres declarees.",
+            )
         )
 
     camping_pitches = pd.to_numeric(
@@ -555,17 +611,17 @@ def prepare_accommodation_calibration(tourism_gdf: gpd.GeoDataFrame, config: dic
     camping_official = _official_value(official, "I553", "PLACE")
     if camping_pitches > 0 and camping_official is not None:
         rows.append(
-            {
-                "parameter_name": "camping_persons_per_pitch",
-                "dataset_type": "camping",
-                "current_value": float(rules.get("camping_persons_per_pitch", 2.5)),
-                "recommended_value": round(camping_official / camping_pitches, 3),
-                "local_reference": float(camping_pitches),
-                "official_reference": camping_official,
-                "official_activity_code": "I553",
-                "official_measure": "PLACE",
-                "method_note": "Rapport entre les places Insee de camping et le nombre local d'emplacements declares.",
-            }
+            _calibration_row(
+                "camping_persons_per_pitch",
+                "camping",
+                float(rules.get("camping_persons_per_pitch", 2.5)),
+                round(camping_official / camping_pitches, 3),
+                float(camping_pitches),
+                camping_official,
+                "I553",
+                "PLACE",
+                "Rapport entre les places Insee de camping et le nombre local d'emplacements declares.",
+            )
         )
 
     short_stay_local = (
@@ -577,17 +633,17 @@ def prepare_accommodation_calibration(tourism_gdf: gpd.GeoDataFrame, config: dic
     short_stay_official = _official_value(official, "I552", "PLACE")
     if short_stay_local > 0 and short_stay_official is not None:
         rows.append(
-            {
-                "parameter_name": "short_stay_persons_proxy",
-                "dataset_type": "collective_locative",
-                "current_value": 1.0,
-                "recommended_value": round(short_stay_official / short_stay_local, 3),
-                "local_reference": float(short_stay_local),
-                "official_reference": short_stay_official,
-                "official_activity_code": "I552",
-                "official_measure": "PLACE",
-                "method_note": "Comparaison de controle entre la somme locale des capacites en personnes et le total Insee des hebergements de courte duree.",
-            }
+            _calibration_row(
+                "short_stay_persons_proxy",
+                "collective_locative",
+                1.0,
+                round(short_stay_official / short_stay_local, 3),
+                float(short_stay_local),
+                short_stay_official,
+                "I552",
+                "PLACE",
+                "Comparaison de controle entre la somme locale des capacites en personnes et le total Insee des hebergements de courte duree.",
+            )
         )
 
     return pd.DataFrame(rows)
@@ -653,6 +709,18 @@ def prepare_beach_polygons(config: dict) -> gpd.GeoDataFrame:
     return beaches[["zone_id", "zone_name", "commune", "source_type", "geometry"]]
 
 
+def _write_dataframe(df: pd.DataFrame, path: Path, sep: str = ",") -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(path, sep=sep, index=False)
+    return path
+
+
+def _write_geodataframe(gdf: gpd.GeoDataFrame, path: Path, layer: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    gdf.to_file(path, layer=layer, driver="GPKG")
+    return path
+
+
 def prepare_external_sources(config: dict) -> dict[str, Path]:
     """
     Execute l'ensemble de la preparation externe et ecrit les tables resultat.
@@ -661,32 +729,25 @@ def prepare_external_sources(config: dict) -> dict[str, Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     tourism = load_and_harmonise_tourism_offers(config)
-    tourism_path = output_dir / "batz_tourism_offers.gpkg"
-    tourism.to_file(tourism_path, layer="tourism_offers", driver="GPKG")
+    tourism_path = _write_geodataframe(tourism, output_dir / "batz_tourism_offers.gpkg", "tourism_offers")
 
     restaurants = prepare_restaurants_table(tourism)
-    restaurants_path = output_dir / "batz_restaurants_prepared.csv"
-    restaurants.to_csv(restaurants_path, sep=";", index=False)
+    restaurants_path = _write_dataframe(restaurants, output_dir / "batz_restaurants_prepared.csv", sep=";")
 
     accommodation_capacity = prepare_accommodation_capacity_table(tourism, config)
-    accommodation_path = output_dir / "batz_accommodation_capacity.csv"
-    accommodation_capacity.to_csv(accommodation_path, index=False)
+    accommodation_path = _write_dataframe(accommodation_capacity, output_dir / "batz_accommodation_capacity.csv")
 
     accommodation_summary = prepare_accommodation_summary(tourism, accommodation_capacity, config)
-    accommodation_summary_path = output_dir / "batz_accommodation_summary.csv"
-    accommodation_summary.to_csv(accommodation_summary_path, index=False)
+    accommodation_summary_path = _write_dataframe(accommodation_summary, output_dir / "batz_accommodation_summary.csv")
 
     accommodation_calibration = prepare_accommodation_calibration(tourism, config)
-    accommodation_calibration_path = output_dir / "batz_accommodation_calibration.csv"
-    accommodation_calibration.to_csv(accommodation_calibration_path, index=False)
+    accommodation_calibration_path = _write_dataframe(accommodation_calibration, output_dir / "batz_accommodation_calibration.csv")
 
     accommodation_overlap = prepare_accommodation_overlap_audit(accommodation_capacity, config)
-    accommodation_overlap_path = output_dir / "batz_accommodation_overlap_audit.csv"
-    accommodation_overlap.to_csv(accommodation_overlap_path, index=False)
+    accommodation_overlap_path = _write_dataframe(accommodation_overlap, output_dir / "batz_accommodation_overlap_audit.csv")
 
     beaches = prepare_beach_polygons(config)
-    beaches_path = output_dir / "batz_beaches.gpkg"
-    beaches.to_file(beaches_path, layer="beaches", driver="GPKG")
+    beaches_path = _write_geodataframe(beaches, output_dir / "batz_beaches.gpkg", "beaches")
 
     logger.info("Preparation externe terminee dans %s", output_dir)
     return {

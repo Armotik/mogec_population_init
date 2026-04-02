@@ -2,4 +2,4 @@
 # COMPATIBILITÉ RACINE
 # =============================================================================
 # Alias historique vers le scénario désormais maintenu dans `config/scenarios/`.
-extends: config/scenarios/summer_day.yaml
+extends: config/scenarios/weekday_school_day.yaml

@@ -194,6 +194,21 @@ Un second outil complete cette lecture :
 
 Il produit `data/04_visualization/profile_activity_explorer.html`, utile pour controler qualitativement les profils, leurs activites et quelques trajectoires individuelles sans passer par un notebook.
 
+Un troisieme script cible la confrontation multi-scenarios a des courbes
+horaires de reference documentees :
+
+```bash
+./.venv/bin/python scripts/run_proxy_validation.py --config config.yaml
+```
+
+Il produit par defaut :
+
+- `data/04_visualization/proxy_validation/proxy_validation_summary.csv`
+- `data/04_visualization/proxy_validation/proxy_validation_curves.csv`
+
+Voir aussi `docs/proxy_validation.md` pour le schema YAML et la logique de
+comparaison par correlation, RMSE et decalage d'heure de pic.
+
 Pour une lecture plus dynamique, un serveur web local est aussi disponible :
 
 ```bash

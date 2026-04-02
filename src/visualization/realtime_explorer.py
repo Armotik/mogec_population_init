@@ -19,7 +19,7 @@ from pyproj import Transformer
 import yaml
 
 from src.core.temporal import build_member_timelines, generer_matrice_horaire
-from src.pipeline import load_config, run_pipeline
+from src.pipeline import load_config, normalize_config_paths, run_pipeline
 
 
 ROLE_COLORS = {
@@ -273,94 +273,111 @@ def _destination_descriptor(destination_id: str, building_lookup: pd.DataFrame) 
     return str(destination_id), "Interne"
 
 
-def build_realtime_explorer_payload(gdf_model: gpd.GeoDataFrame, config: dict) -> dict[str, Any]:
-    member_timelines = build_member_timelines(gdf_model, config)
-    if member_timelines.empty:
-        raise ValueError("Aucune trajectoire individuelle n'a pu etre reconstruite.")
-
-    building_lookup = gdf_model.set_index("building_id")
+def _building_points(gdf_model: gpd.GeoDataFrame, building_lookup: pd.DataFrame) -> dict[str, list[float] | None]:
     transformer = Transformer.from_crs(gdf_model.crs, "EPSG:4326", always_xy=True)
-
-    building_points: dict[str, list[float]] = {}
+    points: dict[str, list[float] | None] = {}
     for building_id, row in building_lookup.iterrows():
         centroid = row.geometry.centroid
-        building_points[str(building_id)] = _to_latlon([float(centroid.x), float(centroid.y)], transformer)
+        points[str(building_id)] = _to_latlon([float(centroid.x), float(centroid.y)], transformer)
+    return points
 
-    members_payload: list[dict[str, Any]] = []
-    households_index: dict[str, dict[str, Any]] = {}
-    school_access_summary: dict[str, int] = defaultdict(int)
 
-    for _, row in member_timelines.iterrows():
-        home_building_id = str(row["home_building_id"])
-        home_point = building_points.get(home_building_id)
-        assigned_destination_id = row["assigned_destination_id"]
-        assigned_destination_point = (
-            building_points.get(str(assigned_destination_id))
-            if assigned_destination_id not in {"DOMICILE", "EXTERIEUR", "None", None}
-            else None
-        )
+def _assigned_destination_point(
+    assigned_destination_id: Any,
+    building_points: dict[str, list[float] | None],
+) -> list[float] | None:
+    if assigned_destination_id in {"DOMICILE", "EXTERIEUR", "None", None}:
+        return None
+    return building_points.get(str(assigned_destination_id))
 
-        timeline_points = []
-        timeline_labels = []
-        timeline_usages = []
-        for destination_id in row["timeline_destinations"]:
-            label, usage = _destination_descriptor(destination_id, building_lookup)
-            timeline_labels.append(label)
-            timeline_usages.append(usage)
-            if destination_id == "DOMICILE":
-                timeline_points.append(home_point)
-            elif destination_id in {"EXTERIEUR", "None", None}:
-                timeline_points.append(None)
-            else:
-                timeline_points.append(building_points.get(str(destination_id)))
 
-        member_payload = {
-            "household_id": str(row.get("household_id") or ""),
-            "member_id": str(row["member_id"]),
-            "role": str(row["role"]),
-            "role_color": ROLE_COLORS.get(str(row["role"]), "#334155"),
-            "home_building_id": home_building_id,
-            "home_point": home_point,
-            "assigned_destination_id": None if assigned_destination_id in {"None", None} else str(assigned_destination_id),
-            "assigned_destination_usage": str(row.get("assigned_destination_usage") or ""),
-            "assigned_destination_point": assigned_destination_point,
-            "escort_mode": str(row.get("escort_mode") or "none"),
-            "school_access_status": str(row.get("school_access_status") or "not_applicable"),
-            "school_distance_m": None if pd.isna(row.get("school_distance_m")) else float(row.get("school_distance_m")),
-            "escort_guardian_id": None if pd.isna(row.get("escort_guardian_id")) else row.get("escort_guardian_id"),
-            "escort_child_ids": [str(item) for item in row.get("escort_child_ids", [])],
-            "escort_stop_hours": [int(hour) for hour in row.get("escort_stop_hours", [])],
-            "timeline_states": [str(item) for item in row["timeline_states"]],
-            "timeline_destinations": [
-                None if item in {"None", None} else str(item)
-                for item in row["timeline_destinations"]
-            ],
-            "timeline_labels": timeline_labels,
-            "timeline_usages": timeline_usages,
-            "timeline_points": timeline_points,
-        }
-        members_payload.append(member_payload)
+def _timeline_payload(
+    timeline_destinations: list[Any],
+    home_point: list[float] | None,
+    building_points: dict[str, list[float] | None],
+    building_lookup: pd.DataFrame,
+) -> tuple[list[str | None], list[str], list[str], list[list[float] | None]]:
+    normalized_destinations: list[str | None] = []
+    labels: list[str] = []
+    usages: list[str] = []
+    points: list[list[float] | None] = []
 
-        household_id = member_payload["household_id"] or member_payload["home_building_id"]
-        household = households_index.setdefault(
-            household_id,
-            {
-                "household_id": household_id,
-                "home_building_id": home_building_id,
-                "home_point": home_point,
-                "member_ids": [],
-                "roles": [],
-                "escort_children_count": 0,
-            },
-        )
-        household["member_ids"].append(member_payload["member_id"])
-        household["roles"].append(member_payload["role"])
-        if member_payload["role"] == "scolaire" and member_payload["escort_mode"] == "escort":
-            household["escort_children_count"] += 1
+    for destination_id in timeline_destinations:
+        label, usage = _destination_descriptor(destination_id, building_lookup)
+        normalized_destinations.append(None if destination_id in {"None", None} else str(destination_id))
+        labels.append(label)
+        usages.append(usage)
+        if destination_id == "DOMICILE":
+            points.append(home_point)
+        elif destination_id in {"EXTERIEUR", "None", None}:
+            points.append(None)
+        else:
+            points.append(building_points.get(str(destination_id)))
 
-        school_access_summary[member_payload["school_access_status"]] += 1
+    return normalized_destinations, labels, usages, points
 
-    households_payload = []
+
+def _member_payload(
+    row: pd.Series,
+    home_point: list[float] | None,
+    building_points: dict[str, list[float] | None],
+    building_lookup: pd.DataFrame,
+) -> dict[str, Any]:
+    assigned_destination_id = row["assigned_destination_id"]
+    timeline_destinations, timeline_labels, timeline_usages, timeline_points = _timeline_payload(
+        row["timeline_destinations"],
+        home_point,
+        building_points,
+        building_lookup,
+    )
+    return {
+        "household_id": str(row.get("household_id") or ""),
+        "member_id": str(row["member_id"]),
+        "role": str(row["role"]),
+        "role_color": ROLE_COLORS.get(str(row["role"]), "#334155"),
+        "home_building_id": str(row["home_building_id"]),
+        "home_point": home_point,
+        "assigned_destination_id": None if assigned_destination_id in {"None", None} else str(assigned_destination_id),
+        "assigned_destination_usage": str(row.get("assigned_destination_usage") or ""),
+        "assigned_destination_point": _assigned_destination_point(assigned_destination_id, building_points),
+        "escort_mode": str(row.get("escort_mode") or "none"),
+        "school_access_status": str(row.get("school_access_status") or "not_applicable"),
+        "school_distance_m": None if pd.isna(row.get("school_distance_m")) else float(row.get("school_distance_m")),
+        "escort_guardian_id": None if pd.isna(row.get("escort_guardian_id")) else row.get("escort_guardian_id"),
+        "escort_child_ids": [str(item) for item in row.get("escort_child_ids", [])],
+        "escort_stop_hours": [int(hour) for hour in row.get("escort_stop_hours", [])],
+        "timeline_states": [str(item) for item in row["timeline_states"]],
+        "timeline_destinations": timeline_destinations,
+        "timeline_labels": timeline_labels,
+        "timeline_usages": timeline_usages,
+        "timeline_points": timeline_points,
+    }
+
+
+def _update_household_index(
+    households_index: dict[str, dict[str, Any]],
+    member_payload: dict[str, Any],
+) -> None:
+    household_id = member_payload["household_id"] or member_payload["home_building_id"]
+    household = households_index.setdefault(
+        household_id,
+        {
+            "household_id": household_id,
+            "home_building_id": member_payload["home_building_id"],
+            "home_point": member_payload["home_point"],
+            "member_ids": [],
+            "roles": [],
+            "escort_children_count": 0,
+        },
+    )
+    household["member_ids"].append(member_payload["member_id"])
+    household["roles"].append(member_payload["role"])
+    if member_payload["role"] == "scolaire" and member_payload["escort_mode"] == "escort":
+        household["escort_children_count"] += 1
+
+
+def _households_payload(households_index: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    households_payload: list[dict[str, Any]] = []
     for household in households_index.values():
         role_counts = pd.Series(household["roles"]).value_counts().to_dict()
         households_payload.append(
@@ -375,13 +392,42 @@ def build_realtime_explorer_payload(gdf_model: gpd.GeoDataFrame, config: dict) -
                 "escort_children_count": int(household["escort_children_count"]),
             }
         )
+    return sorted(households_payload, key=lambda item: item["household_id"])
 
+
+def _map_bounds(gdf_model: gpd.GeoDataFrame) -> list[list[float]]:
     bounds = gdf_model.to_crs("EPSG:4326").total_bounds
+    return [
+        [float(bounds[1]), float(bounds[0])],
+        [float(bounds[3]), float(bounds[2])],
+    ]
+
+
+def build_realtime_explorer_payload(gdf_model: gpd.GeoDataFrame, config: dict) -> dict[str, Any]:
+    member_timelines = build_member_timelines(gdf_model, config)
+    if member_timelines.empty:
+        raise ValueError("Aucune trajectoire individuelle n'a pu etre reconstruite.")
+
+    building_lookup = gdf_model.set_index("building_id")
+    building_points = _building_points(gdf_model, building_lookup)
+
+    members_payload: list[dict[str, Any]] = []
+    households_index: dict[str, dict[str, Any]] = {}
+    school_access_summary: dict[str, int] = defaultdict(int)
+
+    for _, row in member_timelines.iterrows():
+        home_building_id = str(row["home_building_id"])
+        home_point = building_points.get(home_building_id)
+        member_payload = _member_payload(row, home_point, building_points, building_lookup)
+        members_payload.append(member_payload)
+        _update_household_index(households_index, member_payload)
+        school_access_summary[member_payload["school_access_status"]] += 1
+
     return {
         "scenario_name": config.get("scenario", {}).get("name", "scenario"),
         "reference_hour": int(config.get("scenario", {}).get("reference_hour", 0)),
         "members": members_payload,
-        "households": sorted(households_payload, key=lambda item: item["household_id"]),
+        "households": _households_payload(households_index),
         "role_counts": {str(key): int(value) for key, value in member_timelines["role"].value_counts().sort_index().to_dict().items()},
         "school_access_summary": {str(key): int(value) for key, value in sorted(school_access_summary.items())},
         "config_editor": {
@@ -389,10 +435,7 @@ def build_realtime_explorer_payload(gdf_model: gpd.GeoDataFrame, config: dict) -
             "yaml_patch": build_config_patch_yaml(config),
         },
         "map": {
-            "bounds": [
-                [float(bounds[1]), float(bounds[0])],
-                [float(bounds[3]), float(bounds[2])],
-            ],
+            "bounds": _map_bounds(gdf_model),
         },
     }
 
@@ -512,6 +555,7 @@ def render_realtime_explorer_html() -> str:
     button { cursor: pointer; background: #f8fafc; }
     button.primary { background: var(--accent); color: white; border-color: var(--accent); }
     .toolbar { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px; }
+    .toolbar-single { grid-template-columns: 1fr; }
     .hour-line { display: flex; align-items: center; gap: 12px; margin-top: 10px; }
     .hour-pill {
       min-width: 70px;
@@ -607,7 +651,8 @@ def render_realtime_explorer_html() -> str:
           <button class="primary" id="playButton">Lecture</button>
           <button id="refreshButton">Recharger le scenario</button>
         </div>
-        <div class="toolbar" style="grid-template-columns: 1fr;">
+        <div class="toolbar toolbar-single">
+          <button id="followMemberButton">Suivi agent: off</button>
           <button id="resetMapViewButton">Recentrer la carte</button>
         </div>
       </section>
@@ -663,7 +708,8 @@ def render_realtime_explorer_html() -> str:
       configDraftYaml: '',
       playing: false,
       timer: null,
-      mapView: { panX: 0, panY: 0, zoomFactor: 1, dragging: false, pointerId: null, lastX: 0, lastY: 0 },
+      followSelected: false,
+      mapView: { panX: 0, panY: 0, zoomFactor: 1, dragging: false, pointerId: null, lastX: 0, lastY: 0, dragDistance: 0 },
     };
 
     const roleSelect = document.getElementById('roleSelect');
@@ -674,6 +720,7 @@ def render_realtime_explorer_html() -> str:
     const hourLabel = document.getElementById('hourLabel');
     const playButton = document.getElementById('playButton');
     const refreshButton = document.getElementById('refreshButton');
+    const followMemberButton = document.getElementById('followMemberButton');
     const resetMapViewButton = document.getElementById('resetMapViewButton');
     const applyConfigButton = document.getElementById('applyConfigButton');
     const resetConfigButton = document.getElementById('resetConfigButton');
@@ -705,6 +752,16 @@ def render_realtime_explorer_html() -> str:
       if (label === 'domicile') return 'Domicile';
       if (label === 'interne') return member.timeline_labels[hour];
       return 'Exterieur commune';
+    }
+
+    function samePoint(a, b) {
+      if (!a || !b) return false;
+      return a[0] === b[0] && a[1] === b[1];
+    }
+
+    function selectedMember() {
+      if (!state.data || state.memberId === 'all') return null;
+      return state.data.members.find((member) => member.member_id === state.memberId) || null;
     }
 
     function filteredMembers() {
@@ -755,6 +812,7 @@ def render_realtime_explorer_html() -> str:
           ${roleName(role)} (${state.data.role_counts[role]})
         </div>
       `).join('');
+      followMemberButton.textContent = `Suivi agent: ${state.followSelected ? 'on' : 'off'}`;
     }
 
     function renderStats() {
@@ -876,6 +934,12 @@ def render_realtime_explorer_html() -> str:
         memberPanel.innerHTML = '<div class="muted">Personne introuvable.</div>';
         return;
       }
+      const transitions = buildMovementEvents(member).map((movement) => `
+        <div class="list-item">
+          <strong>h${String(movement.hour).padStart(2, '0')}</strong> · ${movement.fromLabel} → ${movement.toLabel}
+          ${movement.distanceM !== null ? `<span class="badge">${movement.distanceM} m</span>` : ''}
+        </div>
+      `).join('');
       const hours = Array.from({ length: 24 }, (_, hour) => `
         <div class="list-item" style="${hour === state.hour ? 'border-color:#1f4e79;background:#eff6ff;' : ''}">
           <strong>h${String(hour).padStart(2, '0')}</strong> · ${activityName(member, hour)}
@@ -888,11 +952,52 @@ def render_realtime_explorer_html() -> str:
           <span class="badge">acces ecole: ${member.school_access_status}</span>
           ${member.escort_guardian_id ? `<span class="badge">parent: ${member.escort_guardian_id}</span>` : ''}
         </div>
-      ` + hours;
+      ` + (transitions ? `<div class="list-item"><strong>Transitions detectees</strong></div>${transitions}` : '') + hours;
     }
 
     function currentPoint(member) {
       return member.timeline_points[state.hour];
+    }
+
+    function haversineDistanceMeters(pointA, pointB) {
+      if (!pointA || !pointB) return null;
+      const toRad = (value) => (value * Math.PI) / 180;
+      const lat1 = toRad(pointA[0]);
+      const lat2 = toRad(pointB[0]);
+      const dLat = lat2 - lat1;
+      const dLon = toRad(pointB[1] - pointA[1]);
+      const a = Math.sin(dLat / 2) ** 2
+        + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLon / 2) ** 2;
+      return Math.round(6371000 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a)));
+    }
+
+    function buildMovementEvents(member) {
+      const events = [];
+      for (let hour = 1; hour < member.timeline_points.length; hour += 1) {
+        const previousPoint = member.timeline_points[hour - 1];
+        const nextPoint = member.timeline_points[hour];
+        const previousLabel = activityName(member, hour - 1);
+        const nextLabel = activityName(member, hour);
+        if (previousLabel === nextLabel && samePoint(previousPoint, nextPoint)) continue;
+        events.push({
+          hour,
+          fromLabel: previousLabel,
+          toLabel: nextLabel,
+          distanceM: previousPoint && nextPoint ? haversineDistanceMeters(previousPoint, nextPoint) : null,
+        });
+      }
+      return events;
+    }
+
+    function buildRouteSegments(member) {
+      const segments = [];
+      for (let hour = 1; hour < member.timeline_points.length; hour += 1) {
+        const startPoint = member.timeline_points[hour - 1];
+        const endPoint = member.timeline_points[hour];
+        if (!startPoint || !endPoint || samePoint(startPoint, endPoint)) continue;
+        segments.push({ hour, startPoint, endPoint });
+      }
+      return segments;
     }
 
     function dedupedPath(points) {
@@ -925,6 +1030,7 @@ def render_realtime_explorer_html() -> str:
       state.mapView.pointerId = null;
       state.mapView.lastX = 0;
       state.mapView.lastY = 0;
+      state.mapView.dragDistance = 0;
       mapRoot.classList.remove('is-dragging');
     }
 
@@ -964,6 +1070,51 @@ def render_realtime_explorer_html() -> str:
       return node;
     }
 
+    function centerMapOnPoint(point) {
+      if (!point || !state.data) return;
+      const view = computeView();
+      if (!view) return;
+      const screenPoint = pointToScreen(point, view);
+      if (!screenPoint) return;
+      state.mapView.panX += (view.width / 2) - screenPoint[0];
+      state.mapView.panY += (view.height / 2) - screenPoint[1];
+    }
+
+    function maybeFollowSelectedMember() {
+      if (!state.followSelected) return;
+      const member = selectedMember();
+      if (!member) return;
+      centerMapOnPoint(currentPoint(member) || member.home_point);
+    }
+
+    function focusMember(memberId) {
+      state.memberId = memberId;
+      const member = selectedMember();
+      if (member) state.householdId = member.household_id || 'all';
+      syncView();
+    }
+
+    function pickMemberAt(clientX, clientY) {
+      const view = computeView();
+      if (!view) return null;
+      const rect = mapRoot.getBoundingClientRect();
+      const x = clientX - rect.left;
+      const y = clientY - rect.top;
+      let bestMember = null;
+      let bestDistance = Infinity;
+      filteredMembers().forEach((member) => {
+        const point = pointToScreen(currentPoint(member), view);
+        if (!point) return;
+        const distance = Math.hypot(point[0] - x, point[1] - y);
+        const hitRadius = state.memberId === member.member_id ? 16 : 12;
+        if (distance <= hitRadius && distance < bestDistance) {
+          bestDistance = distance;
+          bestMember = member;
+        }
+      });
+      return bestMember;
+    }
+
     function tileTemplate(mode) {
       if (mode === 'satellite') return 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}';
       return 'https://tile.openstreetmap.org/{z}/{x}/{y}.png';
@@ -986,6 +1137,7 @@ def render_realtime_explorer_html() -> str:
         state.mapView.pointerId = event.pointerId;
         state.mapView.lastX = event.clientX;
         state.mapView.lastY = event.clientY;
+        state.mapView.dragDistance = 0;
         mapRoot.classList.add('is-dragging');
         mapRoot.setPointerCapture(event.pointerId);
       });
@@ -994,6 +1146,7 @@ def render_realtime_explorer_html() -> str:
         if (!state.mapView.dragging || state.mapView.pointerId !== event.pointerId) return;
         const dx = event.clientX - state.mapView.lastX;
         const dy = event.clientY - state.mapView.lastY;
+        state.mapView.dragDistance += Math.hypot(dx, dy);
         state.mapView.panX += dx;
         state.mapView.panY += dy;
         state.mapView.lastX = event.clientX;
@@ -1003,8 +1156,15 @@ def render_realtime_explorer_html() -> str:
 
       function stopDragging(event) {
         if (state.mapView.pointerId !== null && event.pointerId === state.mapView.pointerId) {
+          if (state.mapView.dragDistance < 6) {
+            const hitMember = pickMemberAt(event.clientX, event.clientY);
+            if (hitMember) {
+              focusMember(hitMember.member_id);
+            }
+          }
           state.mapView.dragging = false;
           state.mapView.pointerId = null;
+          state.mapView.dragDistance = 0;
           mapRoot.classList.remove('is-dragging');
         }
       }
@@ -1069,6 +1229,7 @@ def render_realtime_explorer_html() -> str:
       mapOverlay.setAttribute('width', `${view.width}`);
       mapOverlay.setAttribute('height', `${view.height}`);
       mapOverlay.appendChild(svgElement('rect', { x: 0, y: 0, width: view.width, height: view.height, fill: 'rgba(255,255,255,0.06)' }));
+      const focusedMember = selectedMember();
 
       const members = filteredMembers();
       const household = state.householdId !== 'all'
@@ -1076,20 +1237,72 @@ def render_realtime_explorer_html() -> str:
         : null;
       const homePoint = household ? pointToScreen(household.home_point, view) : null;
 
-      members.forEach((member) => {
-        if (state.memberId === member.member_id) {
-          const path = dedupedPath(member.timeline_points).map((point) => pointToScreen(point, view)).filter(Boolean);
-          if (path.length >= 2) {
-            mapOverlay.appendChild(svgElement('polyline', {
-              points: path.map((item) => `${item[0]},${item[1]}`).join(' '),
-              fill: 'none',
-              stroke: member.role_color,
-              'stroke-width': 3,
-              'stroke-opacity': 0.75,
-            }));
-          }
+      if (focusedMember) {
+        const defs = svgElement('defs');
+        const marker = svgElement('marker', {
+          id: 'routeArrow',
+          markerWidth: 10,
+          markerHeight: 10,
+          refX: 9,
+          refY: 5,
+          orient: 'auto',
+          markerUnits: 'strokeWidth',
+        });
+        marker.appendChild(svgElement('path', {
+          d: 'M 0 0 L 10 5 L 0 10 z',
+          fill: focusedMember.role_color,
+          'fill-opacity': 0.95,
+        }));
+        defs.appendChild(marker);
+        mapOverlay.appendChild(defs);
+
+        const path = dedupedPath(focusedMember.timeline_points).map((point) => pointToScreen(point, view)).filter(Boolean);
+        if (path.length >= 2) {
+          mapOverlay.appendChild(svgElement('polyline', {
+            points: path.map((item) => `${item[0]},${item[1]}`).join(' '),
+            fill: 'none',
+            stroke: focusedMember.role_color,
+            'stroke-width': 2.5,
+            'stroke-opacity': 0.24,
+            'stroke-dasharray': '5 4',
+          }));
         }
-      });
+        buildRouteSegments(focusedMember).forEach((segment) => {
+          const start = pointToScreen(segment.startPoint, view);
+          const end = pointToScreen(segment.endPoint, view);
+          if (!start || !end) return;
+          mapOverlay.appendChild(svgElement('line', {
+            x1: start[0],
+            y1: start[1],
+            x2: end[0],
+            y2: end[1],
+            stroke: focusedMember.role_color,
+            'stroke-width': 3.5,
+            'stroke-opacity': 0.88,
+            'marker-end': 'url(#routeArrow)',
+          }));
+          const midX = (start[0] + end[0]) / 2;
+          const midY = (start[1] + end[1]) / 2;
+          mapOverlay.appendChild(svgElement('circle', {
+            cx: midX,
+            cy: midY,
+            r: 10,
+            fill: 'rgba(255,252,246,0.92)',
+            stroke: focusedMember.role_color,
+            'stroke-width': 1.5,
+          }));
+          const label = svgElement('text', {
+            x: midX,
+            y: midY + 4,
+            'text-anchor': 'middle',
+            'font-size': 10,
+            'font-weight': 700,
+            fill: '#12252b',
+          });
+          label.textContent = `h${String(segment.hour).padStart(2, '0')}`;
+          mapOverlay.appendChild(label);
+        });
+      }
 
       if (homePoint) {
         mapOverlay.appendChild(svgElement('circle', {
@@ -1127,12 +1340,16 @@ def render_realtime_explorer_html() -> str:
         circle.appendChild(title);
         mapOverlay.appendChild(circle);
       });
+      mapBadge.textContent = focusedMember
+        ? `${focusedMember.member_id} suivi${state.followSelected ? ' automatiquement' : ''}. Clique un agent pour changer de cible.`
+        : 'Clique un agent pour afficher sa routine detaillee. Glisser = deplacement, molette = zoom.';
     }
 
     function updateHour(hour) {
       state.hour = Number(hour);
       hourSlider.value = state.hour;
       hourLabel.textContent = `h${String(state.hour).padStart(2, '0')}`;
+      maybeFollowSelectedMember();
       renderStats();
       renderHouseholdPanel();
       renderMemberPanel();
@@ -1157,8 +1374,14 @@ def render_realtime_explorer_html() -> str:
       configPatchTextarea.addEventListener('blur', () => {
         state.configDraftYaml = configPatchTextarea.value;
       });
+      followMemberButton.addEventListener('click', () => {
+        state.followSelected = !state.followSelected;
+        if (state.followSelected) maybeFollowSelectedMember();
+        syncView();
+      });
       resetMapViewButton.addEventListener('click', () => {
         resetMapView();
+        maybeFollowSelectedMember();
         renderMap();
       });
       roleSelect.addEventListener('change', () => {
@@ -1173,12 +1396,12 @@ def render_realtime_explorer_html() -> str:
         syncView();
       });
       memberSelect.addEventListener('change', () => {
-        state.memberId = memberSelect.value;
-        if (state.memberId !== 'all') {
-          const member = state.data.members.find((item) => item.member_id === state.memberId);
-          if (member) state.householdId = member.household_id || 'all';
+        if (memberSelect.value === 'all') {
+          state.memberId = 'all';
+          syncView();
+          return;
         }
-        syncView();
+        focusMember(memberSelect.value);
       });
       hourSlider.addEventListener('input', () => updateHour(hourSlider.value));
 
@@ -1295,6 +1518,7 @@ class _ExplorerState:
                 self._current_config = apply_yaml_patch(self._current_config, yaml_patch)
             if updates:
                 self._current_config = apply_config_updates(self._current_config, updates)
+            self._current_config = normalize_config_paths(self._current_config, self.config_path.parent)
 
             rebuild_mode = _classify_rebuild_mode(
                 _diff_config_paths(previous_config, self._current_config),
