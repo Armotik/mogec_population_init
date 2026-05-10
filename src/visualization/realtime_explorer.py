@@ -1,13 +1,15 @@
 """
-Serveur web local pour explorer les profils et trajectoires en temps quasi reel.
+Serveur web local pour lire les profils et les trajectoires simulées.
 """
 
 from __future__ import annotations
 
 from collections import defaultdict
-from copy import deepcopy
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import logging
+import math
+from numbers import Integral, Real
 from pathlib import Path
 import threading
 from typing import Any
@@ -16,11 +18,13 @@ from urllib.parse import parse_qs, urlparse
 import geopandas as gpd
 import pandas as pd
 from pyproj import Transformer
-import yaml
 
-from src.core.temporal import build_member_timelines, generer_matrice_horaire
-from src.pipeline import load_config, normalize_config_paths, run_pipeline
+from src.core.proxy_validation import evaluate_temporal_proxies
+from src.core.temporal import build_member_timelines
+from src.pipeline import load_config, run_pipeline
 
+logger = logging.getLogger(__name__)
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 ROLE_COLORS = {
     "scolaire": "#0f766e",
@@ -30,226 +34,211 @@ ROLE_COLORS = {
     "inactif": "#64748b",
 }
 
-EDITABLE_CONFIG_FIELDS = [
-    {
-        "path": "scenario.day_of_week",
-        "label": "Jour du scenario",
-        "type": "select",
-        "options": ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi", "Samedi", "Dimanche"],
-    },
-    {
-        "path": "scenario.is_school_holiday",
-        "label": "Vacances scolaires",
-        "type": "boolean",
-    },
-    {
-        "path": "scenario.reference_hour",
-        "label": "Heure de reference T0",
-        "type": "integer",
-        "min": 0,
-        "max": 23,
-        "step": 1,
-    },
-    {
-        "path": "scenario.temporal_context.weather_index",
-        "fallback_path": "temporal_model.scenario_context.weather_index",
-        "label": "Indice meteo",
-        "type": "number",
-        "min": 0,
-        "max": 1,
-        "step": 0.1,
-    },
-    {
-        "path": "scenario.temporal_context.alert_level",
-        "fallback_path": "temporal_model.scenario_context.alert_level",
-        "label": "Niveau d'alerte",
-        "type": "number",
-        "min": 0,
-        "max": 1,
-        "step": 0.1,
-    },
-    {
-        "path": "scenario.residences.alpha_domicile",
-        "label": "Presence residentielle a T0",
-        "type": "number",
-        "min": 0,
-        "max": 1,
-        "step": 0.05,
-    },
-    {
-        "path": "non_residential_model.accommodation.tau_occupation",
-        "label": "Occupation hebergements",
-        "type": "number",
-        "min": 0,
-        "max": 1,
-        "step": 0.05,
-    },
-    {
-        "path": "temporal_model.household_dynamics.school_walk_max_distance_m",
-        "label": "Distance max ecole a pied (m)",
-        "type": "integer",
-        "min": 100,
-        "max": 3000,
-        "step": 50,
-    },
-    {
-        "path": "temporal_model.household_dynamics.school_pickup_overlap_hours",
-        "label": "Tolerance reprise parent (h)",
-        "type": "integer",
-        "min": 0,
-        "max": 4,
-        "step": 1,
-    },
-]
 
-PAYLOAD_ONLY_PATHS = {
-    "scenario.reference_hour",
-}
-
-TEMPORAL_REBUILD_PREFIXES = (
-    "scenario.day_of_week",
-    "scenario.is_school_holiday",
-    "scenario.temporal_context",
-    "temporal_model.scenario_context",
-    "temporal_model.household_dynamics",
-)
+def _make_json_safe(value: Any) -> Any:
+    if value is None or isinstance(value, (str, bool)):
+        return value
+    if isinstance(value, dict):
+        return {str(key): _make_json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_make_json_safe(item) for item in value]
+    if isinstance(value, Integral):
+        return int(value)
+    if isinstance(value, Real):
+        return float(value) if math.isfinite(float(value)) else None
+    if hasattr(value, "item"):
+        try:
+            return _make_json_safe(value.item())
+        except (TypeError, ValueError):  # pragma: no cover - defensive fallback
+            pass
+    try:
+        if pd.isna(value):
+            return None
+    except TypeError:  # pragma: no cover - pandas may reject container-like objects
+        pass
+    return value
 
 
-def _deep_get(config: dict[str, Any], path: str, default: Any = None) -> Any:
-    current: Any = config
-    for key in path.split("."):
-        if not isinstance(current, dict) or key not in current:
-            return default
-        current = current[key]
-    return current
+def _scenario_id_from_path(path: Path, root_dir: Path = PROJECT_ROOT) -> str:
+    try:
+        return path.resolve().relative_to(root_dir.resolve()).as_posix()
+    except ValueError:
+        return path.name
 
 
-def _deep_set(config: dict[str, Any], path: str, value: Any) -> None:
-    current = config
-    parts = path.split(".")
-    for key in parts[:-1]:
-        next_value = current.get(key)
-        if not isinstance(next_value, dict):
-            next_value = {}
-            current[key] = next_value
-        current = next_value
-    current[parts[-1]] = value
+def discover_root_scenarios(root_dir: Path = PROJECT_ROOT, initial_config_path: str | Path | None = None) -> list[dict[str, str]]:
+    scenario_paths = sorted(root_dir.glob("config*.yaml"), key=lambda item: (item.name != "config.yaml", item.name))
+    if initial_config_path is not None:
+        initial_path = Path(initial_config_path).resolve()
+        if initial_path not in [path.resolve() for path in scenario_paths]:
+            scenario_paths.append(initial_path)
+
+    descriptors: list[dict[str, str]] = []
+    seen_ids: set[str] = set()
+    for path in scenario_paths:
+        scenario_id = _scenario_id_from_path(path, root_dir)
+        if scenario_id in seen_ids:
+            continue
+        try:
+            config = load_config(path)
+            scenario_name = str(config.get("scenario", {}).get("name", path.stem))
+        except Exception as exc:  # pragma: no cover - defensive logging
+            logger.warning("Scenario ignore dans l'explorateur (%s): %s", path, exc)
+            continue
+        seen_ids.add(scenario_id)
+        descriptors.append(
+            {
+                "id": scenario_id,
+                "file_name": path.name,
+                "scenario_name": scenario_name,
+                "label": f"{scenario_name} ({path.name})",
+                "config_path": str(path.resolve()),
+            }
+        )
+    return descriptors
 
 
-def _diff_config_paths(before: Any, after: Any, prefix: str = "") -> set[str]:
-    if isinstance(before, dict) and isinstance(after, dict):
-        changed: set[str] = set()
-        for key in set(before) | set(after):
-            child_prefix = f"{prefix}.{key}" if prefix else str(key)
-            if key not in before or key not in after:
-                changed.add(child_prefix)
-                continue
-            changed.update(_diff_config_paths(before[key], after[key], child_prefix))
-        return changed
-    if isinstance(before, list) and isinstance(after, list):
-        return {prefix} if before != after else set()
-    return {prefix} if before != after else set()
+def _coerce_reference_curve_values(reference_curve: object) -> list[float]:
+    if isinstance(reference_curve, dict):
+        return [
+            float(reference_curve[str(hour)]) if str(hour) in reference_curve else float(reference_curve[hour])
+            for hour in range(24)
+        ]
+    if isinstance(reference_curve, (list, tuple)):
+        return [float(value) for value in reference_curve]
+    return []
 
 
-def _classify_rebuild_mode(changed_paths: set[str], has_cached_gdf: bool) -> str:
-    if not has_cached_gdf:
-        return "full"
-    if not changed_paths:
-        return "payload_only"
-    if changed_paths.issubset(PAYLOAD_ONLY_PATHS):
-        return "payload_only"
-    if all(
-        any(path == prefix or path.startswith(f"{prefix}.") for prefix in TEMPORAL_REBUILD_PREFIXES)
-        or path in PAYLOAD_ONLY_PATHS
-        for path in changed_paths
-    ):
-        return "temporal_only"
-    return "full"
+def _proxy_validation_payload(gdf_model: gpd.GeoDataFrame, config: dict) -> dict[str, Any]:
+    summary_df, curves_df = evaluate_temporal_proxies(gdf_model, config)
+    proxy_entries = [proxy for proxy in config.get("proxy_validation", {}).get("temporal_proxies", []) if proxy.get("enabled", True)]
+    if not proxy_entries:
+        return {
+            "active_proxy_count": 0,
+            "status_counts": {"pass": 0, "warn": 0, "fail": 0, "info": 0},
+            "proxies": [],
+        }
 
-
-def _deep_merge_dicts(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
-    merged = deepcopy(base)
-    for key, value in override.items():
-        if isinstance(value, dict) and isinstance(merged.get(key), dict):
-            merged[key] = _deep_merge_dicts(merged[key], value)
-        else:
-            merged[key] = deepcopy(value)
-    return merged
-
-
-def get_editable_config_fields(config: dict[str, Any]) -> list[dict[str, Any]]:
-    fields: list[dict[str, Any]] = []
-    for field in EDITABLE_CONFIG_FIELDS:
-        value = _deep_get(config, field["path"], default=None)
-        if value is None and field.get("fallback_path"):
-            value = _deep_get(config, field["fallback_path"], default=None)
-        fields.append({**field, "value": value})
-    return fields
-
-
-def apply_config_updates(config: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any]:
-    updated = deepcopy(config)
-    field_types = {field["path"]: field["type"] for field in EDITABLE_CONFIG_FIELDS}
-    for path, raw_value in updates.items():
-        field_type = field_types.get(path)
-        if field_type == "boolean":
-            value = bool(raw_value)
-        elif field_type == "integer":
-            value = int(raw_value)
-        elif field_type == "number":
-            value = float(raw_value)
-        else:
-            value = raw_value
-        _deep_set(updated, path, value)
-    return updated
-
-
-def build_config_patch_yaml(config: dict[str, Any]) -> str:
-    patch = {
-        "scenario": {
-            "day_of_week": _deep_get(config, "scenario.day_of_week"),
-            "is_school_holiday": _deep_get(config, "scenario.is_school_holiday"),
-            "reference_hour": _deep_get(config, "scenario.reference_hour"),
-            "temporal_context": {
-                "weather_index": _deep_get(
-                    config,
-                    "scenario.temporal_context.weather_index",
-                    _deep_get(config, "temporal_model.scenario_context.weather_index"),
-                ),
-                "alert_level": _deep_get(
-                    config,
-                    "scenario.temporal_context.alert_level",
-                    _deep_get(config, "temporal_model.scenario_context.alert_level"),
-                ),
-            },
-            "residences": {
-                "alpha_domicile": _deep_get(config, "scenario.residences.alpha_domicile"),
-            },
-        },
-        "non_residential_model": {
-            "accommodation": {
-                "tau_occupation": _deep_get(config, "non_residential_model.accommodation.tau_occupation"),
-            },
-        },
-        "temporal_model": {
-            "household_dynamics": {
-                "school_walk_max_distance_m": _deep_get(config, "temporal_model.household_dynamics.school_walk_max_distance_m"),
-                "school_pickup_overlap_hours": _deep_get(config, "temporal_model.household_dynamics.school_pickup_overlap_hours"),
-            },
-        },
+    summary_lookup = {
+        str(row["proxy_id"]): row.to_dict()
+        for _, row in summary_df.iterrows()
     }
-    return yaml.safe_dump(patch, sort_keys=False, allow_unicode=True)
+    curves_lookup = {
+        str(proxy_id): group.sort_values("hour").to_dict(orient="records")
+        for proxy_id, group in curves_df.groupby("proxy_id", sort=False)
+    }
+
+    proxies_payload: list[dict[str, Any]] = []
+    status_counts: dict[str, int] = {"pass": 0, "warn": 0, "fail": 0, "info": 0}
+    for proxy in proxy_entries:
+        proxy_id = str(proxy.get("proxy_id", ""))
+        summary = summary_lookup.get(proxy_id, {})
+        evidence = proxy.get("evidence", {})
+        status = str(summary.get("status", "info"))
+        status_counts[status] = status_counts.get(status, 0) + 1
+        proxies_payload.append(
+            {
+                "proxy_id": proxy_id,
+                "label": str(proxy.get("label", proxy_id)),
+                "metric": str(proxy.get("metric", "")),
+                "role": str(proxy.get("role", "")),
+                "state": str(proxy.get("state", "")),
+                "usage_any_of": [str(item) for item in proxy.get("usage_any_of", [])],
+                "comparison_normalization": str(proxy.get("comparison_normalization", "max")),
+                "applicable": bool(summary.get("applicable", True)),
+                "status": status,
+                "reason": str(summary.get("reason", "evaluated")),
+                "correlation": summary.get("correlation"),
+                "rmse": summary.get("rmse"),
+                "mae": summary.get("mae"),
+                "modeled_peak_hour": summary.get("modeled_peak_hour"),
+                "reference_peak_hour": summary.get("reference_peak_hour"),
+                "peak_hour_gap": summary.get("peak_hour_gap"),
+                "formula": str(evidence.get("formula", "")),
+                "source_name": str(evidence.get("source_name", summary.get("source_name", ""))),
+                "source_url": str(evidence.get("source_url", "")),
+                "source_url_secondary": str(evidence.get("source_url_secondary", "")),
+                "source_file": str(evidence.get("source_file", "")),
+                "confidence": str(evidence.get("confidence", summary.get("confidence", ""))),
+                "extraction_date": str(evidence.get("extraction_date", summary.get("extraction_date", ""))),
+                "temporal_scope": str(evidence.get("temporal_scope", "")),
+                "spatial_scope": str(evidence.get("spatial_scope", "")),
+                "extraction_method": str(evidence.get("extraction_method", "")),
+                "processing_note": str(evidence.get("processing_note", "")),
+                "uncertainty_note": str(evidence.get("uncertainty_note", "")),
+                "reference_curve": _coerce_reference_curve_values(proxy.get("reference_curve", [])),
+                "curve_rows": curves_lookup.get(proxy_id, []),
+            }
+        )
+
+    return {
+        "active_proxy_count": len(proxies_payload),
+        "status_counts": status_counts,
+        "proxies": proxies_payload,
+    }
 
 
-def apply_yaml_patch(config: dict[str, Any], yaml_patch: str) -> dict[str, Any]:
-    if not yaml_patch.strip():
-        return deepcopy(config)
-    parsed = yaml.safe_load(yaml_patch)
-    if parsed is None:
-        return deepcopy(config)
-    if not isinstance(parsed, dict):
-        raise ValueError("Le patch YAML doit representer un dictionnaire.")
-    return _deep_merge_dicts(config, parsed)
+def _comparison_set_descriptors(
+    config: dict[str, Any],
+    config_path: Path,
+    scenario_catalog: list[dict[str, str]],
+    root_dir: Path = PROJECT_ROOT,
+) -> list[dict[str, Any]]:
+    catalog_by_id = {item["id"]: item for item in scenario_catalog}
+    root_set_entries = [
+        {
+            "scenario_id": item["id"],
+            "label": item["scenario_name"],
+            "file_name": item["file_name"],
+            "config_path": str(Path(item["config_path"]).resolve()),
+        }
+        for item in scenario_catalog
+    ]
+    sets: list[dict[str, Any]] = [
+        {
+            "id": "root_catalog",
+            "label": "Configs racine",
+            "entries": root_set_entries,
+        }
+    ]
+
+    scenario_sets = config.get("proxy_validation", {}).get("scenario_sets", {})
+    for set_name, raw_entries in scenario_sets.items():
+        entries: list[dict[str, str]] = []
+        for raw_entry in raw_entries:
+            if isinstance(raw_entry, str):
+                candidate_path = (config_path.parent / raw_entry).resolve()
+                scenario_id = _scenario_id_from_path(candidate_path, root_dir)
+                catalog_entry = catalog_by_id.get(scenario_id)
+                entries.append(
+                    {
+                        "scenario_id": scenario_id,
+                        "label": catalog_entry["scenario_name"] if catalog_entry else candidate_path.stem,
+                        "file_name": catalog_entry["file_name"] if catalog_entry else candidate_path.name,
+                        "config_path": str(candidate_path),
+                    }
+                )
+            elif isinstance(raw_entry, dict) and raw_entry.get("config_path"):
+                candidate_path = (config_path.parent / str(raw_entry["config_path"])).resolve()
+                scenario_id = _scenario_id_from_path(candidate_path, root_dir)
+                catalog_entry = catalog_by_id.get(scenario_id)
+                entries.append(
+                    {
+                        "scenario_id": scenario_id,
+                        "label": str(raw_entry.get("label") or (catalog_entry["scenario_name"] if catalog_entry else candidate_path.stem)),
+                        "file_name": catalog_entry["file_name"] if catalog_entry else candidate_path.name,
+                        "config_path": str(candidate_path),
+                    }
+                )
+        if entries:
+            sets.append(
+                {
+                    "id": set_name,
+                    "label": f"Jeu {set_name}",
+                    "entries": entries,
+                }
+            )
+    return sets
 
 
 def _to_latlon(point_xy: list[float] | tuple[float, float] | None, transformer: Transformer) -> list[float] | None:
@@ -403,6 +392,181 @@ def _map_bounds(gdf_model: gpd.GeoDataFrame) -> list[list[float]]:
     ]
 
 
+def _hourly_place_presence_payload(
+    gdf_model: gpd.GeoDataFrame,
+    member_timelines: pd.DataFrame,
+) -> list[dict[str, int]]:
+    usage = gdf_model.get("usage_1", pd.Series("", index=gdf_model.index)).fillna("").astype(str)
+    exogenous = gdf_model.get("exogenous_zone_type", pd.Series("", index=gdf_model.index)).fillna("").astype(str)
+    cult = gdf_model.get("is_culte", pd.Series(False, index=gdf_model.index)).fillna(False).astype(bool)
+
+    masks = {
+        "plage": exogenous.eq("plage"),
+        "culte": cult,
+        "enseignement": usage.eq("Enseignement"),
+        "industrie": usage.eq("Industriel"),
+        "travail_services": usage.eq("Commercial et services"),
+        "sport_loisir": usage.eq("Sportif"),
+    }
+
+    hourly_presence: list[dict[str, int]] = []
+    for hour in range(24):
+        column = f"pop_h{hour}"
+        if column in gdf_model.columns:
+            total_by_building = pd.to_numeric(gdf_model[column], errors="coerce").fillna(0.0)
+        else:
+            total_by_building = pd.Series(0.0, index=gdf_model.index)
+
+        domicile = 0
+        exterieur = 0
+        for states in member_timelines["timeline_states"]:
+            state = str(states[hour])
+            if state == "domicile":
+                domicile += 1
+            elif state == "exterieur":
+                exterieur += 1
+
+        hourly_presence.append(
+            {
+                "hour": hour,
+                "domicile": domicile,
+                "exterieur": exterieur,
+                "plage": int(total_by_building.loc[masks["plage"]].sum()),
+                "culte": int(total_by_building.loc[masks["culte"]].sum()),
+                "enseignement": int(total_by_building.loc[masks["enseignement"]].sum()),
+                "industrie": int(total_by_building.loc[masks["industrie"]].sum()),
+                "travail_services": int(total_by_building.loc[masks["travail_services"]].sum()),
+                "sport_loisir": int(total_by_building.loc[masks["sport_loisir"]].sum()),
+            }
+        )
+
+    return hourly_presence
+
+
+def _map_place_presence_payload(
+    gdf_model: gpd.GeoDataFrame,
+    building_points: dict[str, list[float] | None],
+) -> list[dict[str, Any]]:
+    usage = gdf_model.get("usage_1", pd.Series("", index=gdf_model.index)).fillna("").astype(str)
+    exogenous = gdf_model.get("exogenous_zone_type", pd.Series("", index=gdf_model.index)).fillna("").astype(str)
+    cult = gdf_model.get("is_culte", pd.Series(False, index=gdf_model.index)).fillna(False).astype(bool)
+    nature = gdf_model.get("nature", pd.Series("", index=gdf_model.index)).fillna("").astype(str)
+
+    def place_type_for_row(index: int) -> str | None:
+        if exogenous.iloc[index] == "plage":
+            return "plage"
+        if bool(cult.iloc[index]):
+            return "culte"
+        usage_value = usage.iloc[index]
+        if usage_value == "Enseignement":
+            return "enseignement"
+        if usage_value == "Industriel":
+            return "industrie"
+        if usage_value == "Commercial et services":
+            return "travail_services"
+        if usage_value == "Sportif":
+            return "sport_loisir"
+        return None
+
+    places_payload: list[dict[str, Any]] = []
+    for index, row in enumerate(gdf_model.itertuples(index=False)):
+        place_type = place_type_for_row(index)
+        if place_type is None:
+            continue
+        building_id = str(getattr(row, "building_id"))
+        point = building_points.get(building_id)
+        if point is None:
+            continue
+        hourly_counts = []
+        for hour in range(24):
+            raw_value = getattr(row, f"pop_h{hour}", 0)
+            hourly_counts.append(int(pd.to_numeric(raw_value, errors="coerce")) if not pd.isna(raw_value) else 0)
+        if max(hourly_counts) <= 0:
+            continue
+        places_payload.append(
+            {
+                "building_id": building_id,
+                "type": place_type,
+                "label": str(getattr(row, "nom_culte", "") or getattr(row, "nature", "") or getattr(row, "usage_1", "") or building_id),
+                "usage": str(getattr(row, "usage_1", "") or ""),
+                "nature": str(getattr(row, "nature", "") or ""),
+                "point": point,
+                "hourly_counts": hourly_counts,
+            }
+        )
+    return places_payload
+
+
+def _endogenous_presence_by_building(member_timelines: pd.DataFrame) -> dict[str, list[int]]:
+    presence: dict[str, list[int]] = defaultdict(lambda: [0] * 24)
+    for _, row in member_timelines.iterrows():
+        home_building_id = str(row["home_building_id"])
+        for hour, destination in enumerate(row["timeline_destinations"]):
+            if destination == "DOMICILE":
+                presence[home_building_id][hour] += 1
+            elif destination not in {"EXTERIEUR", "None", None}:
+                presence[str(destination)][hour] += 1
+    return dict(presence)
+
+
+def _map_exogenous_presence_payload(
+    gdf_model: gpd.GeoDataFrame,
+    member_timelines: pd.DataFrame,
+    building_points: dict[str, list[float] | None],
+) -> list[dict[str, Any]]:
+    endogenous_presence = _endogenous_presence_by_building(member_timelines)
+    usage = gdf_model.get("usage_1", pd.Series("", index=gdf_model.index)).fillna("").astype(str)
+    exogenous = gdf_model.get("exogenous_zone_type", pd.Series("", index=gdf_model.index)).fillna("").astype(str)
+    cult = gdf_model.get("is_culte", pd.Series(False, index=gdf_model.index)).fillna(False).astype(bool)
+    nature = gdf_model.get("nature", pd.Series("", index=gdf_model.index)).fillna("").astype(str)
+    accommodation = pd.to_numeric(gdf_model.get("pop_nonres_accommodation", pd.Series(0, index=gdf_model.index)), errors="coerce").fillna(0.0)
+
+    def place_type_for_row(index: int) -> str:
+        if exogenous.iloc[index] == "plage":
+            return "plage"
+        if accommodation.iloc[index] > 0:
+            return "hebergement"
+        if bool(cult.iloc[index]):
+            return "culte"
+        usage_value = usage.iloc[index]
+        if usage_value == "Enseignement":
+            return "enseignement"
+        if usage_value == "Industriel":
+            return "industrie"
+        if usage_value == "Commercial et services":
+            return "travail_services"
+        if usage_value == "Sportif":
+            return "sport_loisir"
+        return "autre_exogene"
+
+    places_payload: list[dict[str, Any]] = []
+    for index, row in enumerate(gdf_model.itertuples(index=False)):
+        building_id = str(getattr(row, "building_id"))
+        point = building_points.get(building_id)
+        if point is None:
+            continue
+        endogenous_counts = endogenous_presence.get(building_id, [0] * 24)
+        hourly_counts: list[int] = []
+        for hour in range(24):
+            raw_value = getattr(row, f"pop_h{hour}", 0)
+            total_value = int(pd.to_numeric(raw_value, errors="coerce")) if not pd.isna(raw_value) else 0
+            hourly_counts.append(max(0, total_value - endogenous_counts[hour]))
+        if max(hourly_counts) <= 0:
+            continue
+        places_payload.append(
+            {
+                "building_id": building_id,
+                "type": place_type_for_row(index),
+                "label": str(getattr(row, "nom_culte", "") or getattr(row, "nature", "") or getattr(row, "usage_1", "") or building_id),
+                "usage": str(getattr(row, "usage_1", "") or ""),
+                "nature": str(getattr(row, "nature", "") or ""),
+                "point": point,
+                "hourly_counts": hourly_counts,
+            }
+        )
+    return places_payload
+
+
 def build_realtime_explorer_payload(gdf_model: gpd.GeoDataFrame, config: dict) -> dict[str, Any]:
     member_timelines = build_member_timelines(gdf_model, config)
     if member_timelines.empty:
@@ -430,10 +594,10 @@ def build_realtime_explorer_payload(gdf_model: gpd.GeoDataFrame, config: dict) -
         "households": _households_payload(households_index),
         "role_counts": {str(key): int(value) for key, value in member_timelines["role"].value_counts().sort_index().to_dict().items()},
         "school_access_summary": {str(key): int(value) for key, value in sorted(school_access_summary.items())},
-        "config_editor": {
-            "fields": get_editable_config_fields(config),
-            "yaml_patch": build_config_patch_yaml(config),
-        },
+        "hourly_place_presence": _hourly_place_presence_payload(gdf_model, member_timelines),
+        "map_places": _map_place_presence_payload(gdf_model, building_points),
+        "map_exogenous_places": _map_exogenous_presence_payload(gdf_model, member_timelines, building_points),
+        "proxy_validation": _proxy_validation_payload(gdf_model, config),
         "map": {
             "bounds": _map_bounds(gdf_model),
         },
@@ -446,39 +610,58 @@ def render_realtime_explorer_html() -> str:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Explorateur temps reel MOGEC</title>
+  <title>Lecture interactive MOGEC</title>
   <style>
     :root {
-      --card: rgba(255, 252, 246, 0.96);
+      --page-bg: #f2ede3;
+      --sidebar-bg: #f6f1e8;
+      --card: rgba(255, 255, 252, 0.94);
+      --card-strong: rgba(248, 244, 235, 0.96);
       --line: #d8d0c0;
+      --line-soft: rgba(18, 37, 43, 0.08);
       --ink: #12252b;
       --muted: #5d6a70;
       --accent: #1f4e79;
-      --shadow: 0 16px 40px rgba(18, 37, 43, 0.10);
+      --accent-soft: #e7f0f8;
+      --shadow: 0 18px 40px rgba(18, 37, 43, 0.08);
     }
     * { box-sizing: border-box; }
     body {
       margin: 0;
       font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
       background:
-        radial-gradient(circle at top left, rgba(31, 78, 121, 0.08), transparent 36%),
-        linear-gradient(180deg, #f7f3e8 0%, #efe8da 100%);
+        radial-gradient(circle at top left, rgba(31, 78, 121, 0.08), transparent 28%),
+        radial-gradient(circle at bottom right, rgba(17, 94, 89, 0.08), transparent 26%),
+        linear-gradient(180deg, #f7f3e8 0%, var(--page-bg) 100%);
       color: var(--ink);
+      overflow: hidden;
     }
     .shell {
       display: grid;
-      grid-template-columns: 430px 1fr;
-      min-height: 100vh;
+      grid-template-columns: minmax(500px, 560px) 1fr;
+      height: 100vh;
     }
     .sidebar {
-      padding: 22px 18px;
-      border-right: 1px solid rgba(18, 37, 43, 0.10);
-      background: #f7f3e8;
+      padding: 18px;
+      border-right: 1px solid var(--line-soft);
+      background:
+        linear-gradient(180deg, rgba(255,255,255,0.35), transparent 20%),
+        var(--sidebar-bg);
       overflow-y: auto;
+      min-height: 0;
+    }
+    .sidebar-shell {
+      display: grid;
+      gap: 14px;
+    }
+    .top-strip {
+      display: grid;
+      gap: 14px;
+      position: relative;
     }
     .map-wrap {
       position: relative;
-      min-height: 100vh;
+      min-height: 0;
     }
     #map {
       position: relative;
@@ -527,23 +710,83 @@ def render_realtime_explorer_html() -> str:
     }
     .card {
       background: var(--card);
-      border: 1px solid rgba(18,37,43,0.08);
-      border-radius: 18px;
+      border: 1px solid var(--line-soft);
+      border-radius: 24px;
       box-shadow: var(--shadow);
-      padding: 16px 18px;
-      margin-bottom: 14px;
+      padding: 18px 20px;
     }
-    .hero h1 { margin: 0 0 8px; font-size: 1.95rem; line-height: 1.05; }
-    .muted, .hero p { color: var(--muted); line-height: 1.45; margin: 0; }
-    .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-    label { display: block; font-size: 0.82rem; color: var(--muted); margin-bottom: 6px; }
+    .hero {
+      background:
+        radial-gradient(circle at top right, rgba(31, 78, 121, 0.14), transparent 26%),
+        linear-gradient(160deg, rgba(255,255,255,0.95) 0%, rgba(248,244,235,0.94) 100%);
+    }
+    .hero h1 { margin: 0 0 8px; font-size: 2.15rem; line-height: 0.98; letter-spacing: -0.03em; }
+    .hero-top {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 14px;
+    }
+    .hero-tag {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 7px 12px;
+      border-radius: 999px;
+      background: rgba(31, 78, 121, 0.10);
+      color: var(--accent);
+      font-size: 0.78rem;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+      white-space: nowrap;
+    }
+    .hero-copy {
+      display: grid;
+      gap: 10px;
+      max-width: 38rem;
+    }
+    .muted, .hero p { color: var(--muted); line-height: 1.5; margin: 0; }
+    .hero-note {
+      font-size: 0.86rem;
+      color: var(--muted);
+      padding-top: 6px;
+      border-top: 1px solid var(--line-soft);
+    }
+    .card h3 {
+      margin: 0 0 14px;
+      font-size: 1.02rem;
+      letter-spacing: -0.02em;
+    }
+    .controls-card {
+      background: var(--card-strong);
+    }
+    .controls-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+    }
+    .field {
+      display: grid;
+      gap: 6px;
+    }
+    .field-wide {
+      grid-column: 1 / -1;
+    }
+    .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    label { display: block; font-size: 0.8rem; color: var(--muted); margin-bottom: 0; font-weight: 600; }
     select, input[type="range"], input[type="number"], button, textarea {
       width: 100%;
       border: 1px solid var(--line);
-      border-radius: 12px;
-      padding: 10px 12px;
+      border-radius: 14px;
+      padding: 11px 13px;
       font: inherit;
-      background: white;
+      background: rgba(255,255,255,0.92);
+      transition: border-color 140ms ease, box-shadow 140ms ease, transform 140ms ease;
+    }
+    select:focus, input:focus, button:focus, textarea:focus {
+      outline: none;
+      border-color: rgba(31, 78, 121, 0.45);
+      box-shadow: 0 0 0 4px rgba(31, 78, 121, 0.10);
     }
     textarea {
       min-height: 180px;
@@ -552,34 +795,91 @@ def render_realtime_explorer_html() -> str:
       background: #fffdf8;
       contain: layout paint;
     }
-    button { cursor: pointer; background: #f8fafc; }
-    button.primary { background: var(--accent); color: white; border-color: var(--accent); }
-    .toolbar { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px; }
+    button {
+      cursor: pointer;
+      background: rgba(255,255,255,0.82);
+      font-weight: 600;
+    }
+    button:hover {
+      transform: translateY(-1px);
+    }
+    button.primary {
+      background: linear-gradient(135deg, #2f6996 0%, var(--accent) 100%);
+      color: white;
+      border-color: transparent;
+    }
+    .toolbar { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 12px; }
     .toolbar-single { grid-template-columns: 1fr; }
-    .hour-line { display: flex; align-items: center; gap: 12px; margin-top: 10px; }
+    .hour-line {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 12px;
+      margin-top: 14px;
+      align-items: center;
+    }
     .hour-pill {
-      min-width: 70px;
+      min-width: 82px;
       text-align: center;
       border-radius: 999px;
-      padding: 6px 10px;
-      background: #f1f5f9;
+      padding: 8px 12px;
+      background: var(--accent-soft);
       font-weight: 700;
+      color: var(--accent);
     }
-    .stats { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+      margin-top: 14px;
+    }
     .stat {
-      border-radius: 14px;
-      background: rgba(255,255,255,0.9);
-      border: 1px solid rgba(18,37,43,0.08);
-      padding: 12px;
+      border-radius: 18px;
+      background: rgba(255,255,255,0.90);
+      border: 1px solid var(--line-soft);
+      padding: 13px 14px;
     }
     .stat .label { color: var(--muted); font-size: 0.8rem; }
-    .stat .value { font-size: 1.4rem; font-weight: 700; margin-top: 4px; }
+    .stat .value { font-size: 1.42rem; font-weight: 700; margin-top: 6px; letter-spacing: -0.03em; }
+    .stats-breakdown {
+      display: grid;
+      gap: 10px;
+      margin-top: 14px;
+    }
+    .stats-breakdown-title {
+      font-size: 0.82rem;
+      font-weight: 700;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+    .stats-breakdown-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+    }
+    .stats-breakdown-item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 10px 12px;
+      border-radius: 14px;
+      background: rgba(255,255,255,0.82);
+      border: 1px solid var(--line-soft);
+    }
+    .stats-breakdown-item strong {
+      font-size: 0.9rem;
+    }
+    .stats-breakdown-item span {
+      font-weight: 700;
+      color: var(--accent);
+    }
     .list { display: grid; gap: 8px; }
     .list-item {
-      border-radius: 12px;
-      padding: 10px 12px;
+      border-radius: 14px;
+      padding: 11px 13px;
       background: rgba(255,255,255,0.82);
-      border: 1px solid rgba(18,37,43,0.08);
+      border: 1px solid var(--line-soft);
     }
     .badge {
       display: inline-block;
@@ -594,7 +894,7 @@ def render_realtime_explorer_html() -> str:
       position: absolute;
       right: 16px;
       top: 16px;
-      width: 320px;
+      width: min(360px, calc(100% - 32px));
       z-index: 6;
     }
     .swatch {
@@ -607,80 +907,310 @@ def render_realtime_explorer_html() -> str:
     .config-grid { display: grid; gap: 10px; }
     .checkline { display: flex; align-items: center; gap: 10px; min-height: 42px; }
     .checkline input[type="checkbox"] { width: auto; transform: scale(1.2); }
+    .status-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      border-radius: 999px;
+      padding: 5px 10px;
+      font-size: 0.78rem;
+      font-weight: 700;
+      border: 1px solid rgba(18,37,43,0.08);
+      background: #fff;
+    }
+    .status-pass { color: #166534; background: #dcfce7; }
+    .status-warn { color: #92400e; background: #fef3c7; }
+    .status-fail { color: #991b1b; background: #fee2e2; }
+    .status-info { color: #1e3a8a; background: #dbeafe; }
+    #proxyChart {
+      width: 100%;
+      height: 240px;
+      margin-top: 10px;
+      border: 1px solid rgba(18,37,43,0.08);
+      border-radius: 14px;
+      background: linear-gradient(180deg, #fffef9 0%, #f3eee3 100%);
+    }
+    .proxy-meta a { color: var(--accent); text-decoration: none; }
+    .proxy-meta a:hover { text-decoration: underline; }
+    .proxy-list-item { cursor: pointer; }
+    .proxy-list-item.is-active { border-color: #1f4e79; background: #eff6ff; }
+    .proxy-list-item:hover { border-color: rgba(31,78,121,0.35); }
+    .section-tabs {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 8px;
+      padding: 8px;
+      background: rgba(255,255,255,0.60);
+      border-radius: 18px;
+      border: 1px solid var(--line-soft);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.65);
+      position: sticky;
+      top: 0;
+      z-index: 8;
+      backdrop-filter: blur(8px);
+    }
+    .section-tab {
+      border: 0;
+      border-radius: 14px;
+      background: transparent;
+      color: var(--muted);
+      padding: 10px 12px;
+      text-align: left;
+      display: grid;
+      gap: 2px;
+    }
+    .section-tab strong {
+      color: var(--ink);
+      font-size: 0.9rem;
+    }
+    .section-tab span {
+      font-size: 0.76rem;
+      color: var(--muted);
+    }
+    .section-tab.is-active {
+      background: white;
+      color: var(--accent);
+      box-shadow: 0 8px 20px rgba(18, 37, 43, 0.06);
+    }
+    .section-tab.is-active strong,
+    .section-tab.is-active span {
+      color: inherit;
+    }
+    .panel-stack {
+      display: grid;
+      gap: 14px;
+      align-content: start;
+      min-height: 0;
+    }
+    .panel-card {
+      display: none;
+      min-height: 0;
+    }
+    .panel-card.is-active {
+      display: block;
+    }
+    .panel-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 14px;
+    }
+    .panel-header p {
+      margin: 0;
+      font-size: 0.84rem;
+      color: var(--muted);
+    }
+    .matrix-table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 10px;
+      font-size: 0.88rem;
+      background: rgba(255,255,255,0.82);
+      border-radius: 12px;
+      overflow: hidden;
+    }
+    .matrix-table th,
+    .matrix-table td {
+      padding: 8px 10px;
+      border-bottom: 1px solid rgba(18,37,43,0.08);
+      text-align: left;
+      vertical-align: top;
+    }
+    .matrix-table th {
+      color: var(--muted);
+      font-weight: 600;
+      background: rgba(248,250,252,0.9);
+    }
+    .matrix-table tr.is-current {
+      background: #eff6ff;
+    }
     @media (max-width: 1080px) {
-      .shell { grid-template-columns: 1fr; }
-      .map-wrap, #map { min-height: 70vh; height: 70vh; }
+      body { overflow: auto; }
+      .shell {
+        grid-template-columns: 1fr;
+        height: auto;
+      }
+      .sidebar {
+        min-height: auto;
+        overflow: visible;
+      }
+      .top-strip {
+        position: relative;
+      }
+      .stats {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+      .stats-breakdown-grid {
+        grid-template-columns: 1fr;
+      }
+      .controls-grid,
+      .grid-2,
+      .section-tabs,
+      .toolbar {
+        grid-template-columns: 1fr;
+      }
+      .map-wrap, #map {
+        min-height: 62vh;
+        height: 62vh;
+      }
     }
   </style>
 </head>
 <body>
   <div class="shell">
     <aside class="sidebar">
-      <section class="card hero">
-        <h1>Explorateur temps reel</h1>
-        <p>La preview reste autonome. Le fond de carte s'affiche meme si Leaflet ou les CDN externes sont indisponibles.</p>
-      </section>
+      <div class="sidebar-shell">
+        <div class="top-strip">
+          <section class="card hero">
+            <div class="hero-top">
+              <div class="hero-copy">
+                <div class="hero-tag">MOGEC · Lecture scenario</div>
+                <h1>Lecture interactive du scenario</h1>
+                <p>L'interface est organisee pour lire rapidement un scenario, passer d'un proxy a un foyer ou a une personne, puis revenir a la carte sans perdre le fil.</p>
+              </div>
+            </div>
+            <div class="hero-note">Le fond de secours reste visible si les tuiles externes ne se chargent pas.</div>
+          </section>
 
-      <section class="card">
-        <div class="grid-2">
-          <div>
-            <label for="basemapSelect">Fond de carte</label>
-            <select id="basemapSelect">
-              <option value="plan">Plan</option>
-              <option value="satellite">Satellite</option>
-            </select>
-          </div>
-          <div>
-            <label for="roleSelect">Profil</label>
-            <select id="roleSelect"></select>
-          </div>
-          <div>
-            <label for="householdSelect">Foyer</label>
-            <select id="householdSelect"></select>
-          </div>
-          <div>
-            <label for="memberSelect">Personne</label>
-            <select id="memberSelect"></select>
-          </div>
-        </div>
-        <div class="hour-line">
-          <input type="range" id="hourSlider" min="0" max="23" step="1" value="0">
-          <div class="hour-pill" id="hourLabel">h00</div>
-        </div>
-        <div class="toolbar">
-          <button class="primary" id="playButton">Lecture</button>
-          <button id="refreshButton">Recharger le scenario</button>
-        </div>
-        <div class="toolbar toolbar-single">
-          <button id="followMemberButton">Suivi agent: off</button>
-          <button id="resetMapViewButton">Recentrer la carte</button>
-        </div>
-      </section>
+          <section class="card controls-card">
+            <div class="panel-header">
+              <div>
+                <h3>Pilotage</h3>
+                <p>Scenario, filtres, heure lue et actions principales.</p>
+              </div>
+            </div>
+            <div class="controls-grid">
+              <div class="field">
+                <label for="scenarioSelect">Scenario</label>
+                <select id="scenarioSelect"></select>
+              </div>
+              <div class="field">
+                <label for="basemapSelect">Fond de carte</label>
+                <select id="basemapSelect">
+                  <option value="plan">Plan</option>
+                  <option value="satellite">Satellite</option>
+                </select>
+              </div>
+              <div class="field">
+                <label for="roleSelect">Profil</label>
+                <select id="roleSelect"></select>
+              </div>
+              <div class="field">
+                <label for="householdSelect">Foyer</label>
+                <select id="householdSelect"></select>
+              </div>
+              <div class="field field-wide">
+                <label for="memberSelect">Personne</label>
+                <select id="memberSelect"></select>
+              </div>
+            </div>
+            <div class="hour-line">
+              <input type="range" id="hourSlider" min="0" max="23" step="1" value="0">
+              <div class="hour-pill" id="hourLabel">h00</div>
+            </div>
+            <div class="toolbar">
+              <button class="primary" id="playButton">Lecture</button>
+              <button id="refreshButton">Recharger le scenario</button>
+            </div>
+            <div class="toolbar">
+              <button id="followMemberButton">Suivi automatique : non</button>
+              <button id="resetMapViewButton">Recentrer la carte</button>
+            </div>
+            <div class="stats" id="statsPanel"></div>
+            <div class="stats-breakdown" id="statsBreakdownPanel"></div>
+          </section>
 
-      <section class="card">
-        <h3>Parametres live</h3>
-        <div class="config-grid" id="configPanel"></div>
-        <label for="configPatchTextarea" style="margin-top: 10px;">Patch YAML session</label>
-        <textarea id="configPatchTextarea" spellcheck="false" autocomplete="off" autocorrect="off" autocapitalize="none"></textarea>
-        <div class="toolbar">
-          <button class="primary" id="applyConfigButton">Appliquer</button>
-          <button id="resetConfigButton">Revenir au scenario initial</button>
+          <nav class="section-tabs" aria-label="Navigation laterale">
+            <button type="button" class="section-tab is-active" data-panel-target="proxy">
+              <strong>Validation</strong>
+              <span>proxys et comparaison</span>
+            </button>
+            <button type="button" class="section-tab" data-panel-target="household">
+              <strong>Foyer</strong>
+              <span>lecture familiale</span>
+            </button>
+            <button type="button" class="section-tab" data-panel-target="member">
+              <strong>Agent</strong>
+              <span>matrice horaire</span>
+            </button>
+          </nav>
         </div>
-      </section>
 
-      <section class="card">
-        <div class="stats" id="statsPanel"></div>
-      </section>
+        <div class="panel-stack">
+          <section class="card panel-card is-active" data-panel="proxy">
+            <div class="panel-header">
+              <div>
+                <h3>Validation par proxy</h3>
+                <p>Courbes, statuts, traçabilite et comparaison multi-scenarios.</p>
+              </div>
+            </div>
+            <div class="grid-2">
+              <div>
+                <label for="proxySelect">Proxy</label>
+                <select id="proxySelect"></select>
+              </div>
+              <div>
+                <label for="proxyStatusFilter">Filtre de statut</label>
+                <select id="proxyStatusFilter">
+                  <option value="all">Tous</option>
+                  <option value="pass">PASS</option>
+                  <option value="warn">WARN</option>
+                  <option value="fail">FAIL</option>
+                  <option value="info">INFO</option>
+                </select>
+              </div>
+              <div style="grid-column: 1 / -1;">
+                <label>Etat des proxys</label>
+                <div class="status-row" id="proxyStatusCounts"></div>
+              </div>
+            </div>
+            <div class="toolbar">
+              <button id="exportProxySummaryButton">Exporter synthese CSV</button>
+              <button id="exportProxyCurvesButton">Exporter courbes CSV</button>
+            </div>
+            <div class="list" id="proxyListPanel" style="margin-top: 10px;"></div>
+            <div class="list" id="proxySummaryPanel" style="margin-top: 10px;"></div>
+            <svg id="proxyChart" viewBox="0 0 620 240" preserveAspectRatio="none"></svg>
+            <div class="list proxy-meta" id="proxyMetaPanel" style="margin-top: 10px;"></div>
+            <div class="grid-2" style="margin-top: 14px;">
+              <div>
+                <label for="proxyComparisonSetSelect">Jeu de scenarios</label>
+                <select id="proxyComparisonSetSelect"></select>
+              </div>
+              <div>
+                <label>Comparaison multi-scenarios</label>
+                <div class="toolbar" style="margin-top: 0;">
+                  <button id="loadProxyComparisonButton" class="primary">Lancer comparaison</button>
+                  <button id="exportProxyComparisonButton">Exporter comparaison CSV</button>
+                </div>
+              </div>
+            </div>
+            <div class="list" id="proxyComparisonPanel" style="margin-top: 10px;"></div>
+            <svg id="proxyComparisonChart" viewBox="0 0 620 260" preserveAspectRatio="none" style="width: 100%; height: 260px; margin-top: 10px; border: 1px solid rgba(18,37,43,0.08); border-radius: 14px; background: linear-gradient(180deg, #fffef9 0%, #f3eee3 100%);"></svg>
+          </section>
 
-      <section class="card">
-        <h3>Foyer courant</h3>
-        <div class="list" id="householdPanel"></div>
-      </section>
+          <section class="card panel-card" data-panel="household">
+            <div class="panel-header">
+              <div>
+                <h3>Foyer courant</h3>
+                <p>Composition, accompagnement scolaire et etat courant des membres.</p>
+              </div>
+            </div>
+            <div class="list" id="householdPanel"></div>
+          </section>
 
-      <section class="card">
-        <h3>Trajectoire individuelle</h3>
-        <div class="list" id="memberPanel"></div>
-      </section>
+          <section class="card panel-card" data-panel="member">
+            <div class="panel-header">
+              <div>
+                <h3>Trajectoire individuelle</h3>
+                <p>Chronologie, deplacements et matrice horaire de la personne selectionnee.</p>
+              </div>
+            </div>
+            <div class="list" id="memberPanel"></div>
+          </section>
+        </div>
+      </div>
     </aside>
 
     <main class="map-wrap">
@@ -705,16 +1235,26 @@ def render_realtime_explorer_html() -> str:
       role: 'all',
       householdId: 'all',
       memberId: 'all',
-      configDraftYaml: '',
+      activePanel: 'proxy',
+      proxyId: '',
+      proxyStatusFilter: 'all',
+      proxyComparisonSetId: 'root_catalog',
+      proxyComparison: null,
+      proxyComparisonRequestId: 0,
+      proxyComparisonDirty: true,
       playing: false,
       timer: null,
       followSelected: false,
       mapView: { panX: 0, panY: 0, zoomFactor: 1, dragging: false, pointerId: null, lastX: 0, lastY: 0, dragDistance: 0 },
     };
 
+    const scenarioSelect = document.getElementById('scenarioSelect');
     const roleSelect = document.getElementById('roleSelect');
     const householdSelect = document.getElementById('householdSelect');
     const memberSelect = document.getElementById('memberSelect');
+    const proxySelect = document.getElementById('proxySelect');
+    const proxyStatusFilter = document.getElementById('proxyStatusFilter');
+    const proxyComparisonSetSelect = document.getElementById('proxyComparisonSetSelect');
     const basemapSelect = document.getElementById('basemapSelect');
     const hourSlider = document.getElementById('hourSlider');
     const hourLabel = document.getElementById('hourLabel');
@@ -722,19 +1262,39 @@ def render_realtime_explorer_html() -> str:
     const refreshButton = document.getElementById('refreshButton');
     const followMemberButton = document.getElementById('followMemberButton');
     const resetMapViewButton = document.getElementById('resetMapViewButton');
-    const applyConfigButton = document.getElementById('applyConfigButton');
-    const resetConfigButton = document.getElementById('resetConfigButton');
     const statsPanel = document.getElementById('statsPanel');
+    const statsBreakdownPanel = document.getElementById('statsBreakdownPanel');
     const householdPanel = document.getElementById('householdPanel');
     const memberPanel = document.getElementById('memberPanel');
     const roleLegend = document.getElementById('roleLegend');
     const scenarioLabel = document.getElementById('scenarioLabel');
-    const configPanel = document.getElementById('configPanel');
-    const configPatchTextarea = document.getElementById('configPatchTextarea');
+    const proxyStatusCounts = document.getElementById('proxyStatusCounts');
+    const proxyListPanel = document.getElementById('proxyListPanel');
+    const proxySummaryPanel = document.getElementById('proxySummaryPanel');
+    const proxyMetaPanel = document.getElementById('proxyMetaPanel');
+    const proxyChart = document.getElementById('proxyChart');
+    const proxyComparisonPanel = document.getElementById('proxyComparisonPanel');
+    const proxyComparisonChart = document.getElementById('proxyComparisonChart');
+    const exportProxySummaryButton = document.getElementById('exportProxySummaryButton');
+    const exportProxyCurvesButton = document.getElementById('exportProxyCurvesButton');
+    const exportProxyComparisonButton = document.getElementById('exportProxyComparisonButton');
+    const loadProxyComparisonButton = document.getElementById('loadProxyComparisonButton');
+    const sectionTabs = [...document.querySelectorAll('[data-panel-target]')];
+    const panelCards = [...document.querySelectorAll('[data-panel]')];
     const mapRoot = document.getElementById('map');
     const mapTiles = document.getElementById('mapTiles');
     const mapOverlay = document.getElementById('mapOverlay');
     const mapBadge = document.getElementById('mapBadge');
+
+    function switchPanel(panelId) {
+      state.activePanel = panelId;
+      sectionTabs.forEach((button) => {
+        button.classList.toggle('is-active', button.dataset.panelTarget === panelId);
+      });
+      panelCards.forEach((panel) => {
+        panel.classList.toggle('is-active', panel.dataset.panel === panelId);
+      });
+    }
 
     function roleName(role) {
       return {
@@ -747,11 +1307,24 @@ def render_realtime_explorer_html() -> str:
       }[role] || role;
     }
 
+    function placeTypeName(type) {
+      return {
+        plage: 'Plage',
+        hebergement: 'Hebergement',
+        culte: 'Culte',
+        enseignement: 'Enseignement',
+        industrie: 'Industrie',
+        travail_services: 'Commerce / services',
+        sport_loisir: 'Sport / loisir',
+        autre_exogene: 'Autre exogene',
+      }[type] || type;
+    }
+
     function activityName(member, hour) {
       const label = member.timeline_states[hour];
       if (label === 'domicile') return 'Domicile';
       if (label === 'interne') return member.timeline_labels[hour];
-      return 'Exterieur commune';
+      return 'Extérieur de la commune';
     }
 
     function samePoint(a, b) {
@@ -786,6 +1359,11 @@ def render_realtime_explorer_html() -> str:
 
     function populateControls() {
       if (!state.data) return;
+      scenarioSelect.innerHTML = state.data.available_scenarios
+        .map((scenario) => `<option value="${scenario.id}">${scenario.label}</option>`)
+        .join('');
+      scenarioSelect.value = state.data.selected_scenario_id;
+
       roleSelect.innerHTML = ['all', ...Object.keys(state.data.role_counts)]
         .map((role) => `<option value="${role}">${roleName(role)}</option>`)
         .join('');
@@ -805,14 +1383,33 @@ def render_realtime_explorer_html() -> str:
       if (![...memberSelect.options].some((option) => option.value === state.memberId)) state.memberId = 'all';
       memberSelect.value = state.memberId;
 
-      scenarioLabel.textContent = `${state.data.scenario_name} · T0 = h${String(state.data.reference_hour).padStart(2, '0')}`;
+      const proxies = state.data.proxy_validation?.proxies || [];
+      proxySelect.innerHTML = proxies.length
+        ? proxies.map((proxy) => `<option value="${proxy.proxy_id}">${proxy.label}</option>`).join('')
+        : '<option value="">Aucun proxy actif</option>';
+      if (!proxies.some((proxy) => proxy.proxy_id === state.proxyId)) {
+        state.proxyId = proxies[0]?.proxy_id || '';
+      }
+      proxySelect.value = state.proxyId;
+      proxyStatusFilter.value = state.proxyStatusFilter;
+
+      const comparisonSets = state.data.proxy_comparison_sets || [];
+      proxyComparisonSetSelect.innerHTML = comparisonSets.length
+        ? comparisonSets.map((item) => `<option value="${item.id}">${item.label} (${item.entries.length})</option>`).join('')
+        : '<option value="root_catalog">Configs racine</option>';
+      if (!comparisonSets.some((item) => item.id === state.proxyComparisonSetId)) {
+        state.proxyComparisonSetId = comparisonSets[0]?.id || 'root_catalog';
+      }
+      proxyComparisonSetSelect.value = state.proxyComparisonSetId;
+
+      scenarioLabel.textContent = `${state.data.scenario_name} · ${state.data.selected_scenario_file} · T0 = h${String(state.data.reference_hour).padStart(2, '0')}`;
       roleLegend.innerHTML = Object.keys(state.data.role_counts).map((role) => `
         <div style="margin-top: 8px;">
           <span class="swatch" style="background:${state.data.members.find((member) => member.role === role)?.role_color || '#334155'}"></span>
           ${roleName(role)} (${state.data.role_counts[role]})
         </div>
       `).join('');
-      followMemberButton.textContent = `Suivi agent: ${state.followSelected ? 'on' : 'off'}`;
+      followMemberButton.textContent = `Suivi automatique : ${state.followSelected ? 'oui' : 'non'}`;
     }
 
     function renderStats() {
@@ -826,9 +1423,9 @@ def render_realtime_explorer_html() -> str:
         if (member.role === 'scolaire' && member.escort_mode === 'walk') walking += 1;
       });
       const stats = [
-        ['Population filtree', members.length],
+        ['Population affichee', members.length],
         ['Au domicile', counts.domicile],
-        ['En interne', counts.interne],
+        ['Dans la commune', counts.interne],
         ['Hors commune', counts.exterieur],
         ['Scolaires a pied', walking],
         ['Scolaires accompagnes', escorted],
@@ -839,57 +1436,487 @@ def render_realtime_explorer_html() -> str:
           <div class="value">${value}</div>
         </div>
       `).join('');
+
+      const locationLabels = {
+        domicile: 'Domicile',
+        exterieur: 'Hors commune',
+        plage: 'Plage',
+        culte: 'Culte',
+        enseignement: 'Enseignement',
+        industrie: 'Industrie',
+        travail_services: 'Commerce / services',
+        sport_loisir: 'Sport / loisir',
+      };
+      const hourlyPresence = state.data?.hourly_place_presence?.[state.hour] || null;
+      const breakdownEntries = hourlyPresence
+        ? Object.entries(hourlyPresence)
+            .filter(([key, value]) => key !== 'hour' && Number(value) > 0)
+            .map(([key, value]) => [key, Number(value)])
+        : [];
+      statsBreakdownPanel.innerHTML = breakdownEntries.length
+        ? `
+          <div class="stats-breakdown-title">Occupation totale par type de lieu a h${String(state.hour).padStart(2, '0')}</div>
+          <div class="stats-breakdown-grid">
+            ${breakdownEntries.map(([key, value]) => `
+              <div class="stats-breakdown-item">
+                <strong>${locationLabels[key] || key}</strong>
+                <span>${value}</span>
+              </div>
+            `).join('')}
+          </div>
+        `
+        : '<div class="muted">Aucune personne visible pour cette selection.</div>';
     }
 
-    function renderConfigPanel() {
-      const fields = state.data?.config_editor?.fields || [];
-      configPanel.innerHTML = fields.map((field) => {
-        if (field.type === 'boolean') {
-          return `
-            <div>
-              <label>${field.label}</label>
-              <div class="checkline">
-                <input type="checkbox" data-config-path="${field.path}" ${field.value ? 'checked' : ''}>
-                <span class="muted">${field.value ? 'active' : 'inactive'}</span>
-              </div>
-            </div>
-          `;
+    function selectedProxy() {
+      const proxies = state.data?.proxy_validation?.proxies || [];
+      return proxies.find((proxy) => proxy.proxy_id === state.proxyId) || null;
+    }
+
+    function filteredProxies() {
+      const proxies = state.data?.proxy_validation?.proxies || [];
+      if (state.proxyStatusFilter === 'all') return proxies;
+      return proxies.filter((proxy) => proxy.status === state.proxyStatusFilter);
+    }
+
+    function csvEscape(value) {
+      const stringValue = value === null || value === undefined ? '' : String(value);
+      if (/[",\\n]/.test(stringValue)) return `"${stringValue.replace(/"/g, '""')}"`;
+      return stringValue;
+    }
+
+    function downloadCsv(filename, rows) {
+      if (!rows.length) return;
+      const headers = Object.keys(rows[0]);
+      const lines = [
+        headers.map(csvEscape).join(','),
+        ...rows.map((row) => headers.map((header) => csvEscape(row[header])).join(',')),
+      ];
+      const blob = new Blob([lines.join('\\n')], { type: 'text/csv;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+    }
+
+    async function fetchJsonOrThrow(url, options = {}) {
+      const response = await fetch(url, options);
+      const rawText = await response.text();
+      let payload;
+      try {
+        payload = rawText ? JSON.parse(rawText) : {};
+      } catch (error) {
+        throw new Error(`Reponse JSON invalide depuis ${url} (${error.message})`);
+      }
+      if (!response.ok) {
+        const message = payload?.error || payload?.message || `Requete en echec (${response.status})`;
+        throw new Error(message);
+      }
+      return payload;
+    }
+
+    function setLoadingState(message) {
+      scenarioLabel.textContent = message;
+      mapBadge.textContent = message;
+    }
+
+    function reportActionError(error, fallbackMessage) {
+      console.error(error);
+      const message = error?.message || fallbackMessage;
+      scenarioLabel.textContent = message;
+      mapBadge.textContent = message;
+    }
+
+    function markProxyComparisonDirty(message = 'Comparaison non lancee pour cette selection.') {
+      state.proxyComparisonRequestId += 1;
+      state.proxyComparisonDirty = true;
+      state.proxyComparison = null;
+      exportProxyComparisonButton.disabled = true;
+      proxyComparisonChart.innerHTML = '';
+      proxyComparisonPanel.innerHTML = `<div class="list-item muted">${message}</div>`;
+    }
+
+    function proxySummaryRows() {
+      return (state.data?.proxy_validation?.proxies || []).map((proxy) => ({
+        scenario_name: state.data.scenario_name,
+        proxy_id: proxy.proxy_id,
+        label: proxy.label,
+        metric: proxy.metric,
+        applicable: proxy.applicable,
+        status: proxy.status,
+        reason: proxy.reason,
+        comparison_normalization: proxy.comparison_normalization,
+        correlation: proxy.correlation,
+        rmse: proxy.rmse,
+        mae: proxy.mae,
+        modeled_peak_hour: proxy.modeled_peak_hour,
+        reference_peak_hour: proxy.reference_peak_hour,
+        peak_hour_gap: proxy.peak_hour_gap,
+        source_name: proxy.source_name,
+        extraction_date: proxy.extraction_date,
+        confidence: proxy.confidence,
+      }));
+    }
+
+    function proxyCurveRows() {
+      return (state.data?.proxy_validation?.proxies || []).flatMap((proxy) =>
+        (proxy.curve_rows || []).map((row) => ({
+          scenario_name: state.data.scenario_name,
+          proxy_id: proxy.proxy_id,
+          label: proxy.label,
+          metric: proxy.metric,
+          hour: row.hour,
+          modeled_value: row.modeled_value,
+          reference_value: row.reference_value,
+          modeled_compared: row.modeled_compared,
+          reference_compared: row.reference_compared,
+        }))
+      );
+    }
+
+    function proxyComparisonRows() {
+      return (state.proxyComparison?.scenarios || []).map((row) => ({
+        comparison_set: state.proxyComparison?.set_id || '',
+        comparison_label: state.proxyComparison?.set_label || '',
+        proxy_id: state.proxyComparison?.proxy_id || '',
+        proxy_label: state.proxyComparison?.proxy_label || '',
+        scenario_name: row.scenario_name,
+        scenario_file: row.scenario_file,
+        status: row.status,
+        applicable: row.applicable,
+        reason: row.reason,
+        correlation: row.correlation,
+        rmse: row.rmse,
+        mae: row.mae,
+        peak_hour_gap: row.peak_hour_gap,
+        source_name: row.source_name,
+        extraction_date: row.extraction_date,
+        confidence: row.confidence,
+      }));
+    }
+
+    async function loadProxyComparison() {
+      if (!state.proxyId) {
+        markProxyComparisonDirty('Aucun proxy selectionne pour la comparaison.');
+        return;
+      }
+      const requestId = ++state.proxyComparisonRequestId;
+      state.proxyComparisonDirty = false;
+      loadProxyComparisonButton.disabled = true;
+      proxyComparisonPanel.innerHTML = '<div class="list-item muted">Chargement de la comparaison multi-scenarios...</div>';
+      try {
+        const comparison = await fetchJsonOrThrow('/api/proxy-compare', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            proxy_id: state.proxyId,
+            scenario_set_id: state.proxyComparisonSetId,
+          }),
+        });
+        if (requestId !== state.proxyComparisonRequestId) return;
+        state.proxyComparison = comparison;
+        renderProxyComparison();
+      } catch (error) {
+        if (requestId !== state.proxyComparisonRequestId) return;
+        state.proxyComparison = null;
+        state.proxyComparisonDirty = true;
+        proxyComparisonPanel.innerHTML = `<div class="list-item muted">${error?.message || 'Comparaison indisponible.'}</div>`;
+        proxyComparisonChart.innerHTML = '';
+        console.error(error);
+      } finally {
+        if (requestId === state.proxyComparisonRequestId) {
+          loadProxyComparisonButton.disabled = false;
         }
-        if (field.type === 'select') {
-          return `
-            <div>
-              <label for="cfg-${field.path}">${field.label}</label>
-              <select id="cfg-${field.path}" data-config-path="${field.path}">
-                ${field.options.map((option) => `<option value="${option}" ${option === field.value ? 'selected' : ''}>${option}</option>`).join('')}
-              </select>
-            </div>
-          `;
-        }
-        return `
-          <div>
-            <label for="cfg-${field.path}">${field.label}</label>
-            <input id="cfg-${field.path}" type="number" data-config-path="${field.path}" value="${field.value ?? ''}" min="${field.min ?? ''}" max="${field.max ?? ''}" step="${field.step ?? 'any'}">
-          </div>
-        `;
-      }).join('');
-      const yamlPatch = state.configDraftYaml || state.data?.config_editor?.yaml_patch || '';
-      if (document.activeElement !== configPatchTextarea || configPatchTextarea.value === '') {
-        configPatchTextarea.value = yamlPatch;
       }
     }
 
-    function collectConfigUpdates() {
-      const updates = {};
-      const fields = state.data?.config_editor?.fields || [];
-      fields.forEach((field) => {
-        const element = configPanel.querySelector(`[data-config-path="${field.path}"]`);
-        if (!element) return;
-        if (field.type === 'boolean') updates[field.path] = element.checked;
-        else if (field.type === 'integer') updates[field.path] = Number.parseInt(element.value, 10);
-        else if (field.type === 'number') updates[field.path] = Number.parseFloat(element.value);
-        else updates[field.path] = element.value;
+    function renderProxyValidation() {
+      const proxyValidation = state.data?.proxy_validation;
+      const proxies = proxyValidation?.proxies || [];
+      const counts = proxyValidation?.status_counts || { pass: 0, warn: 0, fail: 0, info: 0 };
+      const visibleProxies = filteredProxies();
+
+      proxyStatusCounts.innerHTML = ['pass', 'warn', 'fail', 'info']
+        .map((status) => `<span class="status-pill status-${status}">${status.toUpperCase()} ${counts[status] || 0}</span>`)
+        .join('');
+      exportProxySummaryButton.disabled = proxies.length === 0;
+      exportProxyCurvesButton.disabled = proxies.length === 0;
+
+      if (!proxies.length) {
+        proxyListPanel.innerHTML = '';
+        proxySummaryPanel.innerHTML = '<div class="list-item muted">Aucun proxy actif dans ce scenario.</div>';
+        proxyMetaPanel.innerHTML = '';
+        proxyChart.innerHTML = '';
+        return;
+      }
+
+      if (!visibleProxies.some((proxy) => proxy.proxy_id === state.proxyId)) {
+        state.proxyId = visibleProxies[0]?.proxy_id || proxies[0]?.proxy_id || '';
+      }
+      proxySelect.innerHTML = visibleProxies.length
+        ? visibleProxies.map((proxy) => `<option value="${proxy.proxy_id}">${proxy.label}</option>`).join('')
+        : '<option value="">Aucun proxy pour ce filtre</option>';
+      proxySelect.value = visibleProxies.some((proxy) => proxy.proxy_id === state.proxyId) ? state.proxyId : '';
+
+      proxyListPanel.innerHTML = visibleProxies.length
+        ? visibleProxies.map((proxy) => `
+            <div class="list-item proxy-list-item ${proxy.proxy_id === state.proxyId ? 'is-active' : ''}" data-proxy-id="${proxy.proxy_id}">
+              <strong>${proxy.label}</strong><br>
+              <span class="status-pill status-${proxy.status}">${String(proxy.status).toUpperCase()}</span>
+              <span class="badge">${proxy.metric}</span>
+              ${proxy.applicable ? '' : `<span class="badge">${proxy.reason}</span>`}
+            </div>
+          `).join('')
+        : '<div class="list-item muted">Aucun proxy ne correspond au filtre choisi.</div>';
+
+      const proxy = selectedProxy();
+      if (!proxy) {
+        proxySummaryPanel.innerHTML = '<div class="list-item muted">Aucun proxy selectionne.</div>';
+        proxyMetaPanel.innerHTML = '';
+        proxyChart.innerHTML = '';
+        return;
+      }
+
+      proxySummaryPanel.innerHTML = `
+        <div class="list-item">
+          <strong>${proxy.label}</strong><br>
+          <span class="status-pill status-${proxy.status}">${String(proxy.status).toUpperCase()}</span>
+          <span class="badge">${proxy.metric}</span>
+          <span class="badge">normalisation : ${proxy.comparison_normalization}</span>
+          ${proxy.applicable ? '' : `<span class="badge">motif : ${proxy.reason}</span>`}
+        </div>
+        <div class="list-item">
+          <span class="badge">corr = ${proxy.correlation ?? 'n/a'}</span>
+          <span class="badge">rmse = ${proxy.rmse ?? 'n/a'}</span>
+          <span class="badge">mae = ${proxy.mae ?? 'n/a'}</span>
+          <span class="badge">ecart pic = ${proxy.peak_hour_gap ?? 'n/a'} h</span>
+        </div>
+      `;
+
+      renderProxyChart(proxy);
+      proxyMetaPanel.innerHTML = `
+        ${proxy.formula ? `<div class="list-item"><strong>Formule</strong><br>${proxy.formula}</div>` : ''}
+        <div class="list-item"><strong>Source</strong><br>${proxy.source_name || 'n/a'}</div>
+        <div class="list-item"><strong>Traçabilite</strong><br>
+          <span class="badge">confiance : ${proxy.confidence || 'n/a'}</span>
+          <span class="badge">date : ${proxy.extraction_date || 'n/a'}</span>
+          ${proxy.temporal_scope ? `<span class="badge">temps : ${proxy.temporal_scope}</span>` : ''}
+          ${proxy.spatial_scope ? `<span class="badge">espace : ${proxy.spatial_scope}</span>` : ''}
+        </div>
+        ${proxy.source_url ? `<div class="list-item"><strong>Source web</strong><br><a href="${proxy.source_url}" target="_blank" rel="noreferrer">${proxy.source_url}</a></div>` : ''}
+        ${proxy.source_url_secondary ? `<div class="list-item"><strong>Source web secondaire</strong><br><a href="${proxy.source_url_secondary}" target="_blank" rel="noreferrer">${proxy.source_url_secondary}</a></div>` : ''}
+        ${proxy.source_file ? `<div class="list-item"><strong>Fichier source</strong><br>${proxy.source_file}</div>` : ''}
+        ${proxy.extraction_method ? `<div class="list-item"><strong>Methode</strong><br>${proxy.extraction_method}</div>` : ''}
+        ${proxy.processing_note ? `<div class="list-item"><strong>Note de traitement</strong><br>${proxy.processing_note}</div>` : ''}
+        ${proxy.uncertainty_note ? `<div class="list-item"><strong>Incertitude</strong><br>${proxy.uncertainty_note}</div>` : ''}
+      `;
+    }
+
+    function renderProxyChart(proxy) {
+      proxyChart.innerHTML = '';
+      const rows = proxy.curve_rows || [];
+      if (!rows.length) {
+        const emptyLabel = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+        emptyLabel.setAttribute('x', '20');
+        emptyLabel.setAttribute('y', '28');
+        emptyLabel.setAttribute('fill', '#64748b');
+        emptyLabel.textContent = 'Aucune courbe disponible pour ce proxy.';
+        proxyChart.appendChild(emptyLabel);
+        return;
+      }
+
+      const width = 620;
+      const height = 240;
+      const padLeft = 42;
+      const padRight = 18;
+      const padTop = 18;
+      const padBottom = 26;
+      const values = rows.flatMap((row) => [Number(row.modeled_compared), Number(row.reference_compared)]);
+      const maxValue = Math.max(1, ...values.map((value) => Number.isFinite(value) ? value : 0));
+      const xForHour = (hour) => padLeft + (hour / 23) * (width - padLeft - padRight);
+      const yForValue = (value) => height - padBottom - (Math.max(0, value) / maxValue) * (height - padTop - padBottom);
+      const polylinePoints = (key) => rows.map((row) => `${xForHour(row.hour)},${yForValue(Number(row[key]))}`).join(' ');
+
+      const ns = 'http://www.w3.org/2000/svg';
+      const make = (tag, attrs = {}) => {
+        const node = document.createElementNS(ns, tag);
+        Object.entries(attrs).forEach(([key, value]) => node.setAttribute(key, String(value)));
+        return node;
+      };
+
+      proxyChart.appendChild(make('rect', { x: 0, y: 0, width, height, fill: 'transparent' }));
+      for (let tick = 0; tick <= 4; tick += 1) {
+        const value = (maxValue / 4) * tick;
+        const y = yForValue(value);
+        proxyChart.appendChild(make('line', { x1: padLeft, y1: y, x2: width - padRight, y2: y, stroke: '#d6d3d1', 'stroke-width': 1 }));
+        const label = make('text', { x: 8, y: y + 4, fill: '#64748b', 'font-size': 11 });
+        label.textContent = value.toFixed(2);
+        proxyChart.appendChild(label);
+      }
+      proxyChart.appendChild(make('line', { x1: padLeft, y1: height - padBottom, x2: width - padRight, y2: height - padBottom, stroke: '#334155', 'stroke-width': 1.5 }));
+      proxyChart.appendChild(make('line', { x1: padLeft, y1: padTop, x2: padLeft, y2: height - padBottom, stroke: '#334155', 'stroke-width': 1.5 }));
+
+      [0, 6, 12, 18, 23].forEach((hour) => {
+        const x = xForHour(hour);
+        proxyChart.appendChild(make('line', { x1: x, y1: height - padBottom, x2: x, y2: height - padBottom + 5, stroke: '#334155', 'stroke-width': 1 }));
+        const label = make('text', { x: x - 8, y: height - 6, fill: '#64748b', 'font-size': 11 });
+        label.textContent = `h${String(hour).padStart(2, '0')}`;
+        proxyChart.appendChild(label);
       });
-      return updates;
+
+      proxyChart.appendChild(make('polyline', {
+        points: polylinePoints('reference_compared'),
+        fill: 'none',
+        stroke: '#b91c1c',
+        'stroke-width': 2.5,
+      }));
+      proxyChart.appendChild(make('polyline', {
+        points: polylinePoints('modeled_compared'),
+        fill: 'none',
+        stroke: '#1d4ed8',
+        'stroke-width': 2.5,
+      }));
+
+      const hourX = xForHour(state.hour);
+      proxyChart.appendChild(make('line', {
+        x1: hourX,
+        y1: padTop,
+        x2: hourX,
+        y2: height - padBottom,
+        stroke: '#0f172a',
+        'stroke-width': 1.5,
+        'stroke-dasharray': '4 4',
+      }));
+      const hourLabel = make('text', { x: hourX + 6, y: padTop + 14, fill: '#0f172a', 'font-size': 11, 'font-weight': 700 });
+      hourLabel.textContent = `heure lue : h${String(state.hour).padStart(2, '0')}`;
+      proxyChart.appendChild(hourLabel);
+    }
+
+    function renderProxyComparison() {
+      const comparison = state.proxyComparison;
+      exportProxyComparisonButton.disabled = !comparison || !(comparison.scenarios || []).length;
+      loadProxyComparisonButton.disabled = false;
+      proxyComparisonChart.innerHTML = '';
+
+      if (!comparison) {
+        proxyComparisonPanel.innerHTML = `<div class="list-item muted">${state.proxyComparisonDirty ? 'Comparaison non lancee pour cette selection.' : 'Aucune comparaison chargee.'}</div>`;
+        return;
+      }
+      const scenarios = comparison.scenarios || [];
+      if (!scenarios.length) {
+        proxyComparisonPanel.innerHTML = '<div class="list-item muted">Aucune comparaison disponible pour ce jeu de scenarios.</div>';
+        return;
+      }
+
+      proxyComparisonPanel.innerHTML = scenarios.map((row) => `
+        <div class="list-item">
+          <strong>${row.scenario_name}</strong><br>
+          <span class="badge">${row.scenario_file}</span>
+          <span class="status-pill status-${row.status}">${String(row.status).toUpperCase()}</span>
+          <span class="badge">corr = ${row.correlation ?? 'n/a'}</span>
+          <span class="badge">rmse = ${row.rmse ?? 'n/a'}</span>
+          <span class="badge">pic = ${row.peak_hour_gap ?? 'n/a'} h</span>
+          ${row.applicable ? '' : `<span class="badge">${row.reason}</span>`}
+        </div>
+      `).join('');
+
+      renderProxyComparisonChart(comparison);
+    }
+
+    function renderProxyComparisonChart(comparison) {
+      const scenarios = comparison.scenarios || [];
+      if (!scenarios.length) return;
+
+      const width = 620;
+      const height = 260;
+      const padLeft = 42;
+      const padRight = 18;
+      const padTop = 18;
+      const padBottom = 26;
+      const values = scenarios.flatMap((scenario) => [
+        ...(scenario.curve_rows || []).map((row) => Number(row.modeled_compared)),
+      ]);
+      if (comparison.reference_curve_rows?.length) {
+        values.push(...comparison.reference_curve_rows.map((row) => Number(row.reference_compared)));
+      }
+      const maxValue = Math.max(1, ...values.map((value) => Number.isFinite(value) ? value : 0));
+      const xForHour = (hour) => padLeft + (hour / 23) * (width - padLeft - padRight);
+      const yForValue = (value) => height - padBottom - (Math.max(0, value) / maxValue) * (height - padTop - padBottom);
+      const ns = 'http://www.w3.org/2000/svg';
+      const make = (tag, attrs = {}) => {
+        const node = document.createElementNS(ns, tag);
+        Object.entries(attrs).forEach(([key, value]) => node.setAttribute(key, String(value)));
+        return node;
+      };
+      const palette = ['#1d4ed8', '#c2410c', '#0f766e', '#7c3aed', '#b45309', '#be123c'];
+
+      proxyComparisonChart.appendChild(make('rect', { x: 0, y: 0, width, height, fill: 'transparent' }));
+      for (let tick = 0; tick <= 4; tick += 1) {
+        const value = (maxValue / 4) * tick;
+        const y = yForValue(value);
+        proxyComparisonChart.appendChild(make('line', { x1: padLeft, y1: y, x2: width - padRight, y2: y, stroke: '#d6d3d1', 'stroke-width': 1 }));
+        const label = make('text', { x: 8, y: y + 4, fill: '#64748b', 'font-size': 11 });
+        label.textContent = value.toFixed(2);
+        proxyComparisonChart.appendChild(label);
+      }
+      proxyComparisonChart.appendChild(make('line', { x1: padLeft, y1: height - padBottom, x2: width - padRight, y2: height - padBottom, stroke: '#334155', 'stroke-width': 1.5 }));
+      proxyComparisonChart.appendChild(make('line', { x1: padLeft, y1: padTop, x2: padLeft, y2: height - padBottom, stroke: '#334155', 'stroke-width': 1.5 }));
+
+      [0, 6, 12, 18, 23].forEach((hour) => {
+        const x = xForHour(hour);
+        proxyComparisonChart.appendChild(make('line', { x1: x, y1: height - padBottom, x2: x, y2: height - padBottom + 5, stroke: '#334155', 'stroke-width': 1 }));
+        const label = make('text', { x: x - 8, y: height - 6, fill: '#64748b', 'font-size': 11 });
+        label.textContent = `h${String(hour).padStart(2, '0')}`;
+        proxyComparisonChart.appendChild(label);
+      });
+
+      if (comparison.reference_curve_rows?.length) {
+        const referencePoints = comparison.reference_curve_rows
+          .map((row) => `${xForHour(row.hour)},${yForValue(Number(row.reference_compared))}`)
+          .join(' ');
+        proxyComparisonChart.appendChild(make('polyline', {
+          points: referencePoints,
+          fill: 'none',
+          stroke: '#b91c1c',
+          'stroke-width': 2,
+          'stroke-dasharray': '6 4',
+        }));
+      }
+
+      scenarios.forEach((scenario, index) => {
+        const color = palette[index % palette.length];
+        const points = (scenario.curve_rows || [])
+          .map((row) => `${xForHour(row.hour)},${yForValue(Number(row.modeled_compared))}`)
+          .join(' ');
+        if (!points) return;
+        proxyComparisonChart.appendChild(make('polyline', {
+          points,
+          fill: 'none',
+          stroke: color,
+          'stroke-width': 2.4,
+        }));
+      });
+
+      let legendY = 20;
+      if (comparison.reference_curve_rows?.length) {
+        proxyComparisonChart.appendChild(make('line', { x1: width - 200, y1: legendY, x2: width - 176, y2: legendY, stroke: '#b91c1c', 'stroke-width': 2, 'stroke-dasharray': '6 4' }));
+        const refLabel = make('text', { x: width - 170, y: legendY + 4, fill: '#334155', 'font-size': 11 });
+        refLabel.textContent = 'reference';
+        proxyComparisonChart.appendChild(refLabel);
+        legendY += 18;
+      }
+      scenarios.forEach((scenario, index) => {
+        const color = palette[index % palette.length];
+        proxyComparisonChart.appendChild(make('line', { x1: width - 200, y1: legendY, x2: width - 176, y2: legendY, stroke: color, 'stroke-width': 2.4 }));
+        const label = make('text', { x: width - 170, y: legendY + 4, fill: '#334155', 'font-size': 11 });
+        label.textContent = scenario.scenario_name;
+        proxyComparisonChart.appendChild(label);
+        legendY += 18;
+      });
     }
 
     function renderHouseholdPanel() {
@@ -897,7 +1924,7 @@ def render_realtime_explorer_html() -> str:
         ? state.data.members.find((member) => member.member_id === state.memberId)?.household_id || 'all'
         : state.householdId;
       if (!state.data || householdId === 'all') {
-        householdPanel.innerHTML = '<div class="muted">Selectionne un foyer ou une personne pour afficher la dynamique familiale.</div>';
+        householdPanel.innerHTML = '<div class="muted">Selectionne un foyer ou une personne pour afficher la situation familiale.</div>';
         return;
       }
       const household = state.data.households.find((item) => item.household_id === householdId);
@@ -910,15 +1937,15 @@ def render_realtime_explorer_html() -> str:
         <div class="list-item">
           <strong>${household.household_id}</strong><br>
           <span class="badge">${household.size} personnes</span>
-          <span class="badge">${household.has_children ? 'avec enfant(s)' : 'sans enfant'}</span>
-          <span class="badge">${household.escort_children_count} escorte(s)</span>
+          <span class="badge">${household.has_children ? 'avec enfant' : 'sans enfant'}</span>
+          <span class="badge">${household.escort_children_count} accompagnement(s)</span>
         </div>
       ` + members.map((member) => `
         <div class="list-item">
           <strong>${member.member_id}</strong><br>
           <span class="badge">${roleName(member.role)}</span>
           <span class="badge">${activityName(member, state.hour)}</span>
-          ${member.school_access_status !== 'not_applicable' ? `<span class="badge">ecole: ${member.school_access_status}</span>` : ''}
+          ${member.school_access_status !== 'not_applicable' ? `<span class="badge">ecole : ${member.school_access_status}</span>` : ''}
           ${member.school_distance_m !== null ? `<span class="badge">${Math.round(member.school_distance_m)} m</span>` : ''}
         </div>
       `).join('');
@@ -926,7 +1953,7 @@ def render_realtime_explorer_html() -> str:
 
     function renderMemberPanel() {
       if (!state.data || state.memberId === 'all') {
-        memberPanel.innerHTML = '<div class="muted">Selectionne une personne pour afficher son pas de temps et son mode d acces.</div>';
+        memberPanel.innerHTML = '<div class="muted">Selectionne une personne pour afficher sa chronologie, son mode d acces et sa matrice horaire.</div>';
         return;
       }
       const member = state.data.members.find((item) => item.member_id === state.memberId);
@@ -940,19 +1967,38 @@ def render_realtime_explorer_html() -> str:
           ${movement.distanceM !== null ? `<span class="badge">${movement.distanceM} m</span>` : ''}
         </div>
       `).join('');
-      const hours = Array.from({ length: 24 }, (_, hour) => `
-        <div class="list-item" style="${hour === state.hour ? 'border-color:#1f4e79;background:#eff6ff;' : ''}">
-          <strong>h${String(hour).padStart(2, '0')}</strong> · ${activityName(member, hour)}
-        </div>
+      const hourlyRows = Array.from({ length: 24 }, (_, hour) => `
+        <tr class="${hour === state.hour ? 'is-current' : ''}">
+          <td><strong>h${String(hour).padStart(2, '0')}</strong></td>
+          <td>${member.timeline_states[hour]}</td>
+          <td>${member.timeline_labels[hour] || 'n/a'}</td>
+          <td>${member.timeline_destinations[hour] || 'n/a'}</td>
+          <td>${activityName(member, hour)}</td>
+        </tr>
       `).join('');
       memberPanel.innerHTML = `
         <div class="list-item">
           <strong>${member.member_id}</strong><br>
           <span class="badge">${roleName(member.role)}</span>
-          <span class="badge">acces ecole: ${member.school_access_status}</span>
-          ${member.escort_guardian_id ? `<span class="badge">parent: ${member.escort_guardian_id}</span>` : ''}
+          <span class="badge">acces ecole : ${member.school_access_status}</span>
+          ${member.escort_guardian_id ? `<span class="badge">adulte referent : ${member.escort_guardian_id}</span>` : ''}
         </div>
-      ` + (transitions ? `<div class="list-item"><strong>Transitions detectees</strong></div>${transitions}` : '') + hours;
+      `
+        + (transitions ? `<div class="list-item"><strong>Changements de lieu</strong></div>${transitions}` : '')
+        + `
+        <div class="list-item"><strong>Matrice horaire</strong><br><span class="muted">Etat, lieu lu et destination associes pour chaque heure.</span></div>
+        <table class="matrix-table">
+          <thead>
+            <tr>
+              <th>Heure</th>
+              <th>Etat</th>
+              <th>Lieu lu</th>
+              <th>Destination</th>
+              <th>Resume</th>
+            </tr>
+          </thead>
+          <tbody>${hourlyRows}</tbody>
+        </table>`;
     }
 
     function currentPoint(member) {
@@ -1091,6 +2137,7 @@ def render_realtime_explorer_html() -> str:
       state.memberId = memberId;
       const member = selectedMember();
       if (member) state.householdId = member.household_id || 'all';
+      switchPanel('member');
       syncView();
     }
 
@@ -1127,7 +2174,7 @@ def render_realtime_explorer_html() -> str:
       mapOverlay.setAttribute('viewBox', '0 0 1 1');
       mapOverlay.setAttribute('width', '1');
       mapOverlay.setAttribute('height', '1');
-      mapBadge.textContent = 'Carte prete, deplace la vue a la souris ou zoome a la molette.';
+      mapBadge.textContent = 'Carte prete. Glisse pour deplacer la vue et utilise la molette pour zoomer.';
     }
 
     function bindMapInteractions() {
@@ -1216,8 +2263,8 @@ def render_realtime_explorer_html() -> str:
         }
       }
       mapBadge.textContent = basemapSelect.value === 'satellite'
-        ? 'Fond satellite si les tuiles externes sont accessibles. Glisser = deplacement, molette = zoom.'
-        : 'Fond plan si les tuiles externes sont accessibles. Glisser = deplacement, molette = zoom.';
+        ? 'Fond satellite si les tuiles externes sont accessibles. Glisse pour deplacer la vue et utilise la molette pour zoomer.'
+        : 'Fond plan si les tuiles externes sont accessibles. Glisse pour deplacer la vue et utilise la molette pour zoomer.';
     }
 
     function renderMap() {
@@ -1236,6 +2283,67 @@ def render_realtime_explorer_html() -> str:
         ? state.data.households.find((item) => item.household_id === state.householdId)
         : null;
       const homePoint = household ? pointToScreen(household.home_point, view) : null;
+      const placeColors = {
+        plage: '#ea580c',
+        hebergement: '#db2777',
+        culte: '#7c3aed',
+        enseignement: '#0f766e',
+        industrie: '#475569',
+        travail_services: '#2563eb',
+        sport_loisir: '#059669',
+        autre_exogene: '#9a3412',
+      };
+      const visiblePlaces = (state.data?.map_exogenous_places || [])
+        .map((place) => ({ ...place, count: Number(place.hourly_counts?.[state.hour] || 0) }))
+        .filter((place) => place.count > 0);
+
+      visiblePlaces.forEach((place) => {
+        const point = pointToScreen(place.point, view);
+        if (!point) return;
+        const color = placeColors[place.type] || '#334155';
+        const radius = Math.max(7, Math.min(28, 5 + Math.sqrt(place.count) / 2.2));
+        mapOverlay.appendChild(svgElement('circle', {
+          cx: point[0],
+          cy: point[1],
+          r: radius,
+          fill: color,
+          'fill-opacity': place.type === 'plage' ? 0.24 : 0.18,
+          stroke: color,
+          'stroke-width': place.type === 'plage' ? 2.2 : 1.6,
+          'stroke-opacity': 0.85,
+        }));
+        mapOverlay.appendChild(svgElement('circle', {
+          cx: point[0],
+          cy: point[1],
+          r: Math.max(3, radius * 0.28),
+          fill: color,
+          'fill-opacity': 0.88,
+          stroke: '#ffffff',
+          'stroke-width': 1.1,
+        }));
+        if (place.count >= 25 || place.type === 'plage') {
+          const label = svgElement('text', {
+            x: point[0],
+            y: point[1] - radius - 6,
+            'text-anchor': 'middle',
+            'font-size': 11,
+            'font-weight': 700,
+            fill: color,
+          });
+          label.textContent = `${placeTypeName(place.type)} ${place.count}`;
+          mapOverlay.appendChild(label);
+        }
+        const title = svgElement('title');
+        title.textContent = `${placeTypeName(place.type)} · ${place.label} · ${place.count} personnes a h${String(state.hour).padStart(2, '0')}`;
+        const hit = svgElement('circle', {
+          cx: point[0],
+          cy: point[1],
+          r: radius + 2,
+          fill: 'transparent',
+        });
+        hit.appendChild(title);
+        mapOverlay.appendChild(hit);
+      });
 
       if (focusedMember) {
         const defs = svgElement('defs');
@@ -1341,8 +2449,8 @@ def render_realtime_explorer_html() -> str:
         mapOverlay.appendChild(circle);
       });
       mapBadge.textContent = focusedMember
-        ? `${focusedMember.member_id} suivi${state.followSelected ? ' automatiquement' : ''}. Clique un agent pour changer de cible.`
-        : 'Clique un agent pour afficher sa routine detaillee. Glisser = deplacement, molette = zoom.';
+        ? `${focusedMember.member_id} ${state.followSelected ? 'reste centre automatiquement' : 'est selectionne'}. Clique une autre personne pour changer de cible.`
+        : 'Clique une personne pour afficher sa journee. Les bulles indiquent la population exogene visible a l heure lue.';
     }
 
     function updateHour(hour) {
@@ -1353,26 +2461,21 @@ def render_realtime_explorer_html() -> str:
       renderStats();
       renderHouseholdPanel();
       renderMemberPanel();
+      renderProxyValidation();
+      renderProxyComparison();
       renderMap();
     }
 
     function syncView() {
       populateControls();
-      renderConfigPanel();
       updateHour(state.hour);
     }
 
     function bindEvents() {
       window.addEventListener('resize', () => renderMap());
       basemapSelect.addEventListener('change', () => renderMap());
-      configPatchTextarea.addEventListener('input', () => {
-        state.configDraftYaml = configPatchTextarea.value;
-      });
-      configPatchTextarea.addEventListener('change', () => {
-        state.configDraftYaml = configPatchTextarea.value;
-      });
-      configPatchTextarea.addEventListener('blur', () => {
-        state.configDraftYaml = configPatchTextarea.value;
+      sectionTabs.forEach((button) => {
+        button.addEventListener('click', () => switchPanel(button.dataset.panelTarget));
       });
       followMemberButton.addEventListener('click', () => {
         state.followSelected = !state.followSelected;
@@ -1390,9 +2493,37 @@ def render_realtime_explorer_html() -> str:
         state.memberId = 'all';
         syncView();
       });
+      scenarioSelect.addEventListener('change', async () => {
+        if (!state.data || scenarioSelect.value === state.data.selected_scenario_id) return;
+        scenarioSelect.disabled = true;
+        refreshButton.disabled = true;
+        setLoadingState('Chargement du scenario...');
+        try {
+          state.data = await fetchJsonOrThrow('/api/scenario', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ scenario_id: scenarioSelect.value }),
+          });
+          state.role = 'all';
+          state.householdId = 'all';
+          state.memberId = 'all';
+          state.proxyId = '';
+          markProxyComparisonDirty('Comparaison a relancer pour le nouveau scenario.');
+          state.hour = state.data.reference_hour;
+          resetMapView();
+          syncView();
+        } catch (error) {
+          reportActionError(error, 'Le changement de scenario a echoue.');
+          scenarioSelect.value = state.data?.selected_scenario_id || scenarioSelect.value;
+        } finally {
+          scenarioSelect.disabled = false;
+          refreshButton.disabled = false;
+        }
+      });
       householdSelect.addEventListener('change', () => {
         state.householdId = householdSelect.value;
         state.memberId = 'all';
+        switchPanel('household');
         syncView();
       });
       memberSelect.addEventListener('change', () => {
@@ -1402,6 +2533,46 @@ def render_realtime_explorer_html() -> str:
           return;
         }
         focusMember(memberSelect.value);
+      });
+      proxySelect.addEventListener('change', () => {
+        state.proxyId = proxySelect.value;
+        switchPanel('proxy');
+        renderProxyValidation();
+        markProxyComparisonDirty('Comparaison a lancer pour le proxy selectionne.');
+      });
+      proxyStatusFilter.addEventListener('change', () => {
+        state.proxyStatusFilter = proxyStatusFilter.value;
+        switchPanel('proxy');
+        renderProxyValidation();
+      });
+      proxyListPanel.addEventListener('click', (event) => {
+        const target = event.target.closest('[data-proxy-id]');
+        if (!target) return;
+        state.proxyId = target.getAttribute('data-proxy-id') || '';
+        switchPanel('proxy');
+        renderProxyValidation();
+        markProxyComparisonDirty('Comparaison a lancer pour le proxy selectionne.');
+      });
+      loadProxyComparisonButton.addEventListener('click', () => {
+        switchPanel('proxy');
+        void loadProxyComparison();
+      });
+      exportProxySummaryButton.addEventListener('click', () => {
+        const scenarioSlug = (state.data?.scenario_name || 'scenario').replace(/[^a-z0-9_-]+/gi, '_');
+        downloadCsv(`${scenarioSlug}_proxy_summary.csv`, proxySummaryRows());
+      });
+      exportProxyCurvesButton.addEventListener('click', () => {
+        const scenarioSlug = (state.data?.scenario_name || 'scenario').replace(/[^a-z0-9_-]+/gi, '_');
+        downloadCsv(`${scenarioSlug}_proxy_curves.csv`, proxyCurveRows());
+      });
+      exportProxyComparisonButton.addEventListener('click', () => {
+        const scenarioSlug = (state.data?.scenario_name || 'scenario').replace(/[^a-z0-9_-]+/gi, '_');
+        downloadCsv(`${scenarioSlug}_proxy_comparison.csv`, proxyComparisonRows());
+      });
+      proxyComparisonSetSelect.addEventListener('change', () => {
+        state.proxyComparisonSetId = proxyComparisonSetSelect.value;
+        switchPanel('proxy');
+        markProxyComparisonDirty('Comparaison a relancer pour ce jeu de scenarios.');
       });
       hourSlider.addEventListener('input', () => updateHour(hourSlider.value));
 
@@ -1418,67 +2589,45 @@ def render_realtime_explorer_html() -> str:
 
       refreshButton.addEventListener('click', async () => {
         refreshButton.disabled = true;
+        scenarioSelect.disabled = true;
         refreshButton.textContent = 'Rechargement...';
-        await loadData(true);
-        refreshButton.disabled = false;
-        refreshButton.textContent = 'Recharger le scenario';
-      });
-
-      applyConfigButton.addEventListener('click', async () => {
-        applyConfigButton.disabled = true;
-        applyConfigButton.textContent = 'Application...';
-        const response = await fetch('/api/config', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            updates: collectConfigUpdates(),
-            yaml_patch: configPatchTextarea.value,
-          }),
-        });
-        state.data = await response.json();
-        state.hour = state.data.reference_hour;
-        state.configDraftYaml = state.data?.config_editor?.yaml_patch || '';
-        resetMapView();
-        syncView();
-        applyConfigButton.disabled = false;
-        applyConfigButton.textContent = 'Appliquer';
-      });
-
-      resetConfigButton.addEventListener('click', async () => {
-        resetConfigButton.disabled = true;
-        resetConfigButton.textContent = 'Reinitialisation...';
-        const response = await fetch('/api/config', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ reset: true }),
-        });
-        state.data = await response.json();
-        state.role = 'all';
-        state.householdId = 'all';
-        state.memberId = 'all';
-        state.hour = state.data.reference_hour;
-        state.configDraftYaml = state.data?.config_editor?.yaml_patch || '';
-        resetMapView();
-        syncView();
-        resetConfigButton.disabled = false;
-        resetConfigButton.textContent = 'Revenir au scenario initial';
+        setLoadingState('Recalcul du scenario en cours...');
+        try {
+          await loadData(true);
+        } catch (error) {
+          reportActionError(error, 'Le rechargement du scenario a echoue.');
+        } finally {
+          refreshButton.disabled = false;
+          scenarioSelect.disabled = false;
+          refreshButton.textContent = 'Recharger le scenario';
+        }
       });
     }
 
     async function loadData(refresh = false) {
-      const response = await fetch(`/api/state${refresh ? '?refresh=1' : ''}`);
-      state.data = await response.json();
+      state.data = await fetchJsonOrThrow(`/api/state${refresh ? '?refresh=1' : ''}`);
       state.hour = state.data.reference_hour;
-      state.configDraftYaml = state.data?.config_editor?.yaml_patch || '';
+      if (!(state.data.proxy_validation?.proxies || []).some((proxy) => proxy.proxy_id === state.proxyId)) {
+        state.proxyId = state.data.proxy_validation?.proxies?.[0]?.proxy_id || '';
+      }
+      if (!(state.data.proxy_comparison_sets || []).some((item) => item.id === state.proxyComparisonSetId)) {
+        state.proxyComparisonSetId = state.data.proxy_comparison_sets?.[0]?.id || 'root_catalog';
+      }
       resetMapView();
       syncView();
+      markProxyComparisonDirty(refresh ? 'Comparaison a relancer apres rechargement.' : 'Comparaison disponible sur demande.');
     }
 
     async function bootstrap() {
       initMap();
       bindMapInteractions();
       bindEvents();
-      await loadData(false);
+      setLoadingState('Chargement du scenario initial...');
+      try {
+        await loadData(false);
+      } catch (error) {
+        reportActionError(error, 'Le chargement initial a echoue.');
+      }
     }
 
     bootstrap();
@@ -1490,56 +2639,158 @@ def render_realtime_explorer_html() -> str:
 
 class _ExplorerState:
     def __init__(self, config_path: str | Path):
-        self.config_path = Path(config_path)
+        self.project_root = PROJECT_ROOT
+        self.config_path = Path(config_path).resolve()
         self._lock = threading.Lock()
-        self._base_config = load_config(self.config_path)
-        self._current_config = deepcopy(self._base_config)
+        self._scenario_catalog = discover_root_scenarios(self.project_root, self.config_path)
+        self._scenario_paths = {
+            scenario["id"]: Path(scenario["config_path"]).resolve()
+            for scenario in self._scenario_catalog
+        }
+        self._current_scenario_id = _scenario_id_from_path(self.config_path, self.project_root)
+        if self._current_scenario_id not in self._scenario_paths:
+            self._scenario_paths[self._current_scenario_id] = self.config_path
+            self._scenario_catalog.append(
+                {
+                    "id": self._current_scenario_id,
+                    "file_name": self.config_path.name,
+                    "scenario_name": self.config_path.stem,
+                    "label": f"{self.config_path.stem} ({self.config_path.name})",
+                    "config_path": str(self.config_path),
+                }
+            )
+        self._current_config = load_config(self._scenario_paths[self._current_scenario_id])
         self._gdf: gpd.GeoDataFrame | None = None
         self._payload: dict[str, Any] | None = None
+        self._proxy_eval_cache: dict[str, tuple[pd.DataFrame, pd.DataFrame]] = {}
+
+    def _comparison_sets(self) -> list[dict[str, Any]]:
+        return _comparison_set_descriptors(
+            self._current_config,
+            self.config_path,
+            self._scenario_catalog,
+            self.project_root,
+        )
+
+    def _with_catalog(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return {
+            **payload,
+            "available_scenarios": self._scenario_catalog,
+            "proxy_comparison_sets": self._comparison_sets(),
+            "selected_scenario_id": self._current_scenario_id,
+            "selected_scenario_file": self._scenario_paths[self._current_scenario_id].name,
+        }
+
+    def _evaluate_proxy_scenario(
+        self,
+        scenario_id: str,
+        scenario_path: str | Path | None = None,
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        resolved_path = Path(scenario_path).resolve() if scenario_path is not None else self._scenario_paths.get(scenario_id)
+        if resolved_path is None:
+            raise ValueError(f"Scenario inconnu pour comparaison: {scenario_id}")
+        cache_key = str(resolved_path)
+        with self._lock:
+            cached = self._proxy_eval_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        config = load_config(resolved_path)
+        gdf = run_pipeline(config)
+        evaluated = evaluate_temporal_proxies(gdf, config)
+        with self._lock:
+            return self._proxy_eval_cache.setdefault(cache_key, evaluated)
+
+    def compare_proxy(self, proxy_id: str, scenario_set_id: str) -> dict[str, Any]:
+        with self._lock:
+            comparison_sets = {item["id"]: item for item in self._comparison_sets()}
+            selected_set = comparison_sets.get(scenario_set_id) or comparison_sets.get("root_catalog")
+        if selected_set is None:
+            return {
+                "set_id": scenario_set_id,
+                "set_label": scenario_set_id,
+                "proxy_id": proxy_id,
+                "proxy_label": proxy_id,
+                "reference_curve_rows": [],
+                "scenarios": [],
+            }
+
+        proxy_label = proxy_id
+        scenarios_payload: list[dict[str, Any]] = []
+        reference_curve_rows: list[dict[str, Any]] = []
+
+        for entry in selected_set["entries"]:
+            scenario_id = str(entry["scenario_id"])
+            scenario_path = Path(str(entry["config_path"])).resolve()
+            summary_df, curves_df = self._evaluate_proxy_scenario(scenario_id, scenario_path)
+            summary_row = summary_df[summary_df["proxy_id"] == proxy_id]
+            if summary_row.empty:
+                continue
+            row = summary_row.iloc[0]
+            curve_rows = curves_df[curves_df["proxy_id"] == proxy_id].sort_values("hour")
+            proxy_label = str(row.get("label", proxy_label))
+            scenario_name = str(row.get("scenario_name", entry["label"]))
+            scenario_payload = {
+                "scenario_id": scenario_id,
+                "scenario_name": str(entry.get("label") or scenario_name),
+                "scenario_file": str(entry.get("file_name") or scenario_path.name),
+                "status": str(row.get("status", "info")),
+                "applicable": bool(row.get("applicable", True)),
+                "reason": str(row.get("reason", "evaluated")),
+                "correlation": None if pd.isna(row.get("correlation")) else float(row.get("correlation")),
+                "rmse": None if pd.isna(row.get("rmse")) else float(row.get("rmse")),
+                "mae": None if pd.isna(row.get("mae")) else float(row.get("mae")),
+                "peak_hour_gap": None if pd.isna(row.get("peak_hour_gap")) else int(row.get("peak_hour_gap")),
+                "source_name": str(row.get("source_name", "")),
+                "extraction_date": str(row.get("extraction_date", "")),
+                "confidence": str(row.get("confidence", "")),
+                "curve_rows": curve_rows.to_dict(orient="records"),
+            }
+            scenarios_payload.append(scenario_payload)
+            if not reference_curve_rows and not curve_rows.empty:
+                reference_curve_rows = [
+                    {
+                        "hour": int(item["hour"]),
+                        "reference_compared": float(item["reference_compared"]),
+                    }
+                    for item in curve_rows.to_dict(orient="records")
+                ]
+
+        return {
+            "set_id": str(selected_set["id"]),
+            "set_label": str(selected_set["label"]),
+            "proxy_id": proxy_id,
+            "proxy_label": proxy_label,
+            "reference_curve_rows": reference_curve_rows,
+            "scenarios": scenarios_payload,
+        }
 
     def payload(self, refresh: bool = False) -> dict[str, Any]:
         with self._lock:
             if refresh or self._payload is None or self._gdf is None:
+                if refresh:
+                    self._proxy_eval_cache.pop(str(self._scenario_paths[self._current_scenario_id]), None)
                 self._gdf = run_pipeline(self._current_config)
-                self._payload = build_realtime_explorer_payload(self._gdf, self._current_config)
+                self._payload = self._with_catalog(build_realtime_explorer_payload(self._gdf, self._current_config))
             return self._payload
 
-    def update_config(
-        self,
-        updates: dict[str, Any] | None = None,
-        yaml_patch: str | None = None,
-        reset: bool = False,
-    ) -> dict[str, Any]:
+    def select_scenario(self, scenario_id: str) -> dict[str, Any]:
         with self._lock:
-            previous_config = deepcopy(self._current_config)
-            if reset:
-                self._current_config = deepcopy(self._base_config)
-            if yaml_patch:
-                self._current_config = apply_yaml_patch(self._current_config, yaml_patch)
-            if updates:
-                self._current_config = apply_config_updates(self._current_config, updates)
-            self._current_config = normalize_config_paths(self._current_config, self.config_path.parent)
-
-            rebuild_mode = _classify_rebuild_mode(
-                _diff_config_paths(previous_config, self._current_config),
-                has_cached_gdf=self._gdf is not None,
-            )
-            if rebuild_mode == "full":
-                self._gdf = run_pipeline(self._current_config)
-            elif rebuild_mode == "temporal_only":
-                self._gdf = generer_matrice_horaire(self._gdf, self._current_config)
-
-            if self._gdf is None:
-                self._gdf = run_pipeline(self._current_config)
-            self._payload = build_realtime_explorer_payload(self._gdf, self._current_config)
+            if scenario_id not in self._scenario_paths:
+                raise ValueError(f"Scenario inconnu: {scenario_id}")
+            self._current_scenario_id = scenario_id
+            self.config_path = self._scenario_paths[scenario_id]
+            self._current_config = load_config(self.config_path)
+            self._gdf = run_pipeline(self._current_config)
+            self._proxy_eval_cache.pop(str(self.config_path), None)
+            self._payload = self._with_catalog(build_realtime_explorer_payload(self._gdf, self._current_config))
             return self._payload
 
 
 def _handler_factory(state: _ExplorerState):
     class ExplorerHandler(BaseHTTPRequestHandler):
-        def _send_json(self, payload: dict[str, Any]) -> None:
-            data = json.dumps(payload).encode("utf-8")
-            self.send_response(200)
+        def _send_json(self, payload: dict[str, Any], status_code: int = 200) -> None:
+            data = json.dumps(_make_json_safe(payload), allow_nan=False).encode("utf-8")
+            self.send_response(status_code)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
@@ -1555,27 +2806,41 @@ def _handler_factory(state: _ExplorerState):
 
         def do_GET(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)
-            if parsed.path == "/api/state":
-                refresh = parse_qs(parsed.query).get("refresh", ["0"])[0] == "1"
-                self._send_json(state.payload(refresh=refresh))
-                return
-            if parsed.path in {"/", "/index.html"}:
-                self._send_html(render_realtime_explorer_html())
-                return
-            self.send_error(404, "Resource not found")
+            try:
+                if parsed.path == "/api/state":
+                    refresh = parse_qs(parsed.query).get("refresh", ["0"])[0] == "1"
+                    self._send_json(state.payload(refresh=refresh))
+                    return
+                if parsed.path in {"/", "/index.html"}:
+                    self._send_html(render_realtime_explorer_html())
+                    return
+                self.send_error(404, "Resource not found")
+            except Exception as exc:  # pragma: no cover - HTTP safety net
+                logger.exception("Erreur HTTP GET %s", parsed.path)
+                self._send_json({"error": str(exc)}, status_code=500)
 
         def do_POST(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)
-            if parsed.path != "/api/config":
+            try:
+                if parsed.path == "/api/scenario":
+                    content_length = int(self.headers.get("Content-Length", "0"))
+                    raw_body = self.rfile.read(content_length) if content_length > 0 else b"{}"
+                    payload = json.loads(raw_body.decode("utf-8") or "{}")
+                    scenario_id = str(payload.get("scenario_id", "")).strip()
+                    self._send_json(state.select_scenario(scenario_id))
+                    return
+                if parsed.path == "/api/proxy-compare":
+                    content_length = int(self.headers.get("Content-Length", "0"))
+                    raw_body = self.rfile.read(content_length) if content_length > 0 else b"{}"
+                    payload = json.loads(raw_body.decode("utf-8") or "{}")
+                    proxy_id = str(payload.get("proxy_id", "")).strip()
+                    scenario_set_id = str(payload.get("scenario_set_id", "root_catalog")).strip() or "root_catalog"
+                    self._send_json(state.compare_proxy(proxy_id, scenario_set_id))
+                    return
                 self.send_error(404, "Resource not found")
-                return
-            content_length = int(self.headers.get("Content-Length", "0"))
-            raw_body = self.rfile.read(content_length) if content_length > 0 else b"{}"
-            payload = json.loads(raw_body.decode("utf-8") or "{}")
-            updates = payload.get("updates", {})
-            yaml_patch = payload.get("yaml_patch", "")
-            reset = bool(payload.get("reset", False))
-            self._send_json(state.update_config(updates=updates, yaml_patch=yaml_patch, reset=reset))
+            except Exception as exc:  # pragma: no cover - HTTP safety net
+                logger.exception("Erreur HTTP POST %s", parsed.path)
+                self._send_json({"error": str(exc)}, status_code=500)
 
         def log_message(self, format: str, *args) -> None:  # noqa: A003
             return

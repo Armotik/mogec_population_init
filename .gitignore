@@ -1,3 +1,26 @@
 data/*
-.venv/*
 cache/*
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+
+# Coverage
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# IDE
+.idea/
+.vscode/
+
+# OS artifacts
+.DS_Store

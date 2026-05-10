@@ -24,7 +24,7 @@ def test_load_bd_topo_with_mask(bati_raw, config):
     print(f"\n[Loader] {len(bati_raw)} bâtiments extraits (Buffer: {buffer_m}m).")
 
 
-def test_load_study_area_boundary_falls_back_when_local_file_is_missing(monkeypatch):
+def test_load_study_area_boundary_raises_when_local_file_is_missing_and_fallback_disabled(monkeypatch):
     fallback_boundary = gpd.GeoDataFrame(
         {"name": ["fallback"]},
         geometry=[Polygon([(0, 0), (0, 1), (1, 1), (1, 0)])],
@@ -45,16 +45,16 @@ def test_load_study_area_boundary_falls_back_when_local_file_is_missing(monkeypa
             "commune_name": "Batz-sur-Mer, Loire-Atlantique, France",
             "boundary_path": "data/01_raw/gpkg/introuvable.gpkg",
             "buffer_m": 200,
+            "allow_network_fallback": False,
         },
     }
 
-    boundary = load_study_area_boundary(config, strict=False)
+    with pytest.raises(FileNotFoundError):
+        load_study_area_boundary(config, strict=False)
+    assert "args" not in called
 
-    assert boundary is fallback_boundary
-    assert called["args"] == ("Batz-sur-Mer, Loire-Atlantique, France", 2154, 200)
 
-
-def test_load_study_area_boundary_falls_back_when_local_filter_is_empty(tmp_path, monkeypatch):
+def test_load_study_area_boundary_raises_when_local_filter_is_empty_and_fallback_disabled(tmp_path, monkeypatch):
     boundary_path = tmp_path / "boundary.gpkg"
     gpd.GeoDataFrame(
         {"libelle_commune": ["Le Croisic"]},
@@ -85,11 +85,49 @@ def test_load_study_area_boundary_falls_back_when_local_filter_is_empty(tmp_path
             "boundary_name_field": "libelle_commune",
             "boundary_name_value": "Batz-sur-Mer",
             "buffer_m": 0,
+            "allow_network_fallback": False,
+        },
+    }
+
+    with pytest.raises(FileNotFoundError):
+        load_study_area_boundary(config, strict=True)
+    assert "args" not in called
+
+
+def test_load_study_area_boundary_falls_back_when_enabled(tmp_path, monkeypatch):
+    boundary_path = tmp_path / "boundary.gpkg"
+    gpd.GeoDataFrame(
+        {"libelle_commune": ["Le Croisic"]},
+        geometry=[Polygon([(0, 0), (0, 1), (1, 1), (1, 0)])],
+        crs="EPSG:4326",
+    ).to_file(boundary_path, layer="commune", driver="GPKG")
+
+    fallback_boundary = gpd.GeoDataFrame(
+        {"name": ["fallback"]},
+        geometry=[Polygon([(0, 0), (0, 2), (2, 2), (2, 0)])],
+        crs="EPSG:2154",
+    )
+    called = {}
+
+    def fake_get_study_area_boundary(commune_name, target_crs=2154, buffer_m=0):
+        called["args"] = (commune_name, target_crs, buffer_m)
+        return fallback_boundary
+
+    monkeypatch.setattr("src.io.loaders.get_study_area_boundary", fake_get_study_area_boundary)
+    config = {
+        "project": {"crs_epsg": 2154},
+        "study_area": {
+            "commune_name": "Batz-sur-Mer, Loire-Atlantique, France",
+            "boundary_path": str(boundary_path),
+            "boundary_layer": "commune",
+            "boundary_name_field": "libelle_commune",
+            "boundary_name_value": "Batz-sur-Mer",
+            "buffer_m": 0,
+            "allow_network_fallback": True,
         },
     }
 
     boundary = load_study_area_boundary(config, strict=True)
-
     assert boundary is fallback_boundary
     assert called["args"] == ("Batz-sur-Mer, Loire-Atlantique, France", 2154, 0)
 

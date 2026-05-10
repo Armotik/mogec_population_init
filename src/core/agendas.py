@@ -35,6 +35,12 @@ OUTSIDE_DESTINATION = "EXTERIEUR"
 NON_INTERNAL_DESTINATIONS = {HOME_DESTINATION, OUTSIDE_DESTINATION, 'None', None}
 
 
+def _households_allowed_for_row(row) -> bool:
+    if not bool(row.get('is_culte', False)):
+        return True
+    return bool(row.get('culte_household_allowed', False))
+
+
 def _employment_targets_for_adults(adult_pool: int, config: dict) -> dict[str, int]:
     employment_cfg = config['demographics']['employment']
     local_pct = float(employment_cfg.get('travail_local_pct', 0.0))
@@ -372,7 +378,12 @@ def _build_global_role_converter(
 
 
 def _global_target_role_counts(df: gpd.GeoDataFrame, config: dict) -> dict[str, int]:
-    return _target_role_counts(int(df['pop_t0'].sum()), config)
+    if 'is_culte' not in df.columns:
+        return _target_role_counts(int(df['pop_t0'].sum()), config)
+
+    household_allowed_mask = (~df['is_culte']) | df.get('culte_household_allowed', False)
+    modeled_population = int(df.loc[household_allowed_mask, 'pop_t0'].sum())
+    return _target_role_counts(modeled_population, config)
 
 
 def _assert_exact_global_role_counts(df: gpd.GeoDataFrame, config: dict) -> None:
@@ -471,6 +482,9 @@ def _members_for_household(building_id: str, household_index: int, roles: list[s
 
 
 def _build_households_for_row(row, df: gpd.GeoDataFrame, config: dict, rng: np.random.Generator) -> list[dict]:
+    if not _households_allowed_for_row(row):
+        return []
+
     population = int(row['pop_t0'])
     if population <= 0:
         return []

@@ -1,13 +1,14 @@
+from pathlib import Path
+
 import geopandas as gpd
+import pandas as pd
 from shapely.geometry import Polygon
 
+from src.visualization import realtime_explorer
 from src.visualization.realtime_explorer import (
-    _classify_rebuild_mode,
-    _diff_config_paths,
-    apply_config_updates,
-    apply_yaml_patch,
+    _ExplorerState,
+    _make_json_safe,
     build_realtime_explorer_payload,
-    get_editable_config_fields,
     render_realtime_explorer_html,
 )
 
@@ -78,10 +79,12 @@ def test_realtime_explorer_payload_contains_households_and_school_access():
     assert len(payload['households']) == 1
     assert payload['households'][0]['household_id'] == 'HH1'
     assert payload['households'][0]['escort_children_count'] == 1
-    assert 'config_editor' in payload
-    editable_paths = {field['path'] for field in payload['config_editor']['fields']}
-    assert 'scenario.day_of_week' in editable_paths
-    assert 'temporal_model.household_dynamics.school_walk_max_distance_m' in editable_paths
+    assert 'hourly_place_presence' in payload
+    assert len(payload['hourly_place_presence']) == 24
+    assert 'map_places' in payload
+    assert 'map_exogenous_places' in payload
+    assert 'proxy_validation' in payload
+    assert payload['proxy_validation']['active_proxy_count'] == 0
     child = next(member for member in payload['members'] if member['member_id'] == 'child')
     assert child['school_access_status'] == 'escort'
     assert child['timeline_points'][8] is not None
@@ -90,114 +93,151 @@ def test_realtime_explorer_payload_contains_households_and_school_access():
 def test_realtime_explorer_html_mentions_satellite_and_api():
     html = render_realtime_explorer_html()
 
-    assert 'Explorateur temps reel' in html
+    assert 'Lecture interactive du scenario' in html
     assert 'satellite' in html.lower()
     assert '/api/state' in html
-    assert '/api/config' in html
-    assert 'configPatchTextarea' in html
+    assert '/api/scenario' in html
+    assert 'scenarioSelect' in html
+    assert 'proxySelect' in html
+    assert 'proxyStatusFilter' in html
+    assert 'proxyListPanel' in html
+    assert 'proxyChart' in html
+    assert '/api/proxy-compare' in html
+    assert 'proxyComparisonSetSelect' in html
+    assert 'proxyComparisonChart' in html
+    assert 'loadProxyComparisonButton' in html
+    assert 'exportProxyComparisonButton' in html
+    assert 'exportProxySummaryButton' in html
+    assert 'exportProxyCurvesButton' in html
+    assert 'fetchJsonOrThrow' in html
+    assert 'Chargement du scenario...' in html
+    assert 'Comparaison non lancee pour cette selection.' in html
+    assert 'Matrice horaire' in html
+    assert 'matrix-table' in html
+    assert '/[",\\n]/.test(stringValue)' in html
+    assert "lines.join('\\n')" in html
     assert 'map-tiles' in html
     assert 'function initMap()' in html
     assert '.map-tiles,' in html
     assert 'pointer-events: none;' in html
-    assert 'configDraftYaml' in html
-    assert 'spellcheck="false"' in html
-    assert 'autocapitalize="none"' in html
-    assert "configPatchTextarea.addEventListener('input'" in html
-    assert "configPatchTextarea.addEventListener('change'" in html
-    assert "configPatchTextarea.addEventListener('blur'" in html
+    assert 'configPatchTextarea' not in html
+    assert '/api/config' not in html
 
 
-def test_editable_config_fields_and_updates():
-    config = {
-        'scenario': {
-            'day_of_week': 'Jeudi',
-            'is_school_holiday': False,
-            'reference_hour': 2,
-            'residences': {'alpha_domicile': 0.95},
-        },
-        'temporal_model': {
-            'scenario_context': {'weather_index': 0.2, 'alert_level': 0.8},
-            'household_dynamics': {
-                'school_walk_max_distance_m': 1200,
-                'school_pickup_overlap_hours': 1,
-            },
-        },
-        'non_residential_model': {
-            'accommodation': {'tau_occupation': 0.10},
+def test_compare_proxy_loads_scenario_from_explicit_config_path(monkeypatch, tmp_path):
+    root_config = tmp_path / "config.yaml"
+    scenario_dir = tmp_path / "config" / "scenarios"
+    scenario_dir.mkdir(parents=True)
+    contrast_config = scenario_dir / "summer_day.yaml"
+    root_config.write_text("scenario: {}\n", encoding="utf-8")
+    contrast_config.write_text("scenario: {}\n", encoding="utf-8")
+
+    current_config = {
+        "scenario": {"name": "scenario_courant"},
+        "proxy_validation": {
+            "scenario_sets": {
+                "contrast": [
+                    {
+                        "config_path": "config/scenarios/summer_day.yaml",
+                        "label": "ete_jour_vacances",
+                    }
+                ]
+            }
         },
     }
+    contrast_loaded_config = {"scenario": {"name": "scenario_ete"}}
 
-    fields = get_editable_config_fields(config)
-    values_by_path = {field['path']: field['value'] for field in fields}
-    assert values_by_path['scenario.day_of_week'] == 'Jeudi'
-    assert values_by_path['scenario.temporal_context.weather_index'] == 0.2
+    def fake_discover_root_scenarios(root_dir: Path, initial_config_path: str | Path | None = None) -> list[dict[str, str]]:
+        return [
+            {
+                "id": "config.yaml",
+                "file_name": "config.yaml",
+                "scenario_name": "scenario_courant",
+                "label": "scenario_courant (config.yaml)",
+                "config_path": str(root_config.resolve()),
+            }
+        ]
 
-    updated = apply_config_updates(
-        config,
-        {
-            'scenario.day_of_week': 'Dimanche',
-            'scenario.is_school_holiday': True,
-            'scenario.temporal_context.weather_index': 0.9,
-            'temporal_model.household_dynamics.school_walk_max_distance_m': 800,
-        },
-    )
-    assert updated['scenario']['day_of_week'] == 'Dimanche'
-    assert updated['scenario']['is_school_holiday'] is True
-    assert updated['scenario']['temporal_context']['weather_index'] == 0.9
-    assert updated['temporal_model']['household_dynamics']['school_walk_max_distance_m'] == 800
+    def fake_load_config(path: str | Path) -> dict:
+        resolved = Path(path).resolve()
+        if resolved == root_config.resolve():
+            return current_config
+        if resolved == contrast_config.resolve():
+            return contrast_loaded_config
+        raise AssertionError(f"Chemin inattendu: {resolved}")
 
-    yaml_updated = apply_yaml_patch(
-        config,
-        """
-scenario:
-  day_of_week: "Dimanche"
-  temporal_context:
-    alert_level: 0.3
-""",
-    )
-    assert yaml_updated['scenario']['day_of_week'] == 'Dimanche'
-    assert yaml_updated['scenario']['temporal_context']['alert_level'] == 0.3
+    def fake_run_pipeline(config: dict) -> str:
+        return str(config["scenario"]["name"])
+
+    def fake_evaluate_temporal_proxies(gdf_model: str, config: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
+        scenario_name = str(config["scenario"]["name"])
+        summary_df = pd.DataFrame(
+            [
+                {
+                    "scenario_name": scenario_name,
+                    "proxy_id": "proxy_demo",
+                    "label": "Proxy demo",
+                    "metric": "role_state_share",
+                    "applicable": True,
+                    "status": "pass",
+                    "reason": "evaluated",
+                    "correlation": 0.91,
+                    "rmse": 0.08,
+                    "mae": 0.05,
+                    "peak_hour_gap": 1,
+                    "source_name": "Source test",
+                    "extraction_date": "2026-04-03",
+                    "confidence": "high",
+                }
+            ]
+        )
+        curves_df = pd.DataFrame(
+            [
+                {
+                    "scenario_name": scenario_name,
+                    "proxy_id": "proxy_demo",
+                    "label": "Proxy demo",
+                    "metric": "role_state_share",
+                    "hour": hour,
+                    "modeled_value": float(hour),
+                    "reference_value": float(hour + 1),
+                    "modeled_compared": float(hour),
+                    "reference_compared": float(hour + 1),
+                }
+                for hour in range(24)
+            ]
+        )
+        return summary_df, curves_df
+
+    monkeypatch.setattr(realtime_explorer, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(realtime_explorer, "discover_root_scenarios", fake_discover_root_scenarios)
+    monkeypatch.setattr(realtime_explorer, "load_config", fake_load_config)
+    monkeypatch.setattr(realtime_explorer, "run_pipeline", fake_run_pipeline)
+    monkeypatch.setattr(realtime_explorer, "evaluate_temporal_proxies", fake_evaluate_temporal_proxies)
+
+    state = _ExplorerState(root_config)
+    comparison = state.compare_proxy("proxy_demo", "contrast")
+
+    assert comparison["set_id"] == "contrast"
+    assert comparison["proxy_id"] == "proxy_demo"
+    assert len(comparison["scenarios"]) == 1
+    assert comparison["scenarios"][0]["scenario_name"] == "ete_jour_vacances"
+    assert comparison["scenarios"][0]["scenario_file"] == "summer_day.yaml"
+    assert len(comparison["reference_curve_rows"]) == 24
 
 
-def test_rebuild_mode_classification():
-    before = {
-        'scenario': {
-            'reference_hour': 2,
-            'day_of_week': 'Jeudi',
-            'temporal_context': {'weather_index': 0.2},
-            'residences': {'alpha_domicile': 0.95},
-        },
-        'temporal_model': {
-            'household_dynamics': {'school_walk_max_distance_m': 1200},
-        },
+def test_make_json_safe_replaces_non_finite_numbers():
+    payload = {
+        "ok": 1,
+        "nan_value": float("nan"),
+        "nested": [float("inf"), {"neg_inf": float("-inf")}],
+        "text": "stable",
     }
 
-    after_reference = {
-        **before,
-        'scenario': {
-            **before['scenario'],
-            'reference_hour': 8,
-        },
-    }
-    changed_reference = _diff_config_paths(before, after_reference)
-    assert _classify_rebuild_mode(changed_reference, has_cached_gdf=True) == 'payload_only'
+    safe = _make_json_safe(payload)
 
-    after_temporal = {
-        **before,
-        'scenario': {
-            **before['scenario'],
-            'day_of_week': 'Dimanche',
-        },
-    }
-    changed_temporal = _diff_config_paths(before, after_temporal)
-    assert _classify_rebuild_mode(changed_temporal, has_cached_gdf=True) == 'temporal_only'
-
-    after_structural = {
-        **before,
-        'scenario': {
-            **before['scenario'],
-            'residences': {'alpha_domicile': 0.75},
-        },
-    }
-    changed_structural = _diff_config_paths(before, after_structural)
-    assert _classify_rebuild_mode(changed_structural, has_cached_gdf=True) == 'full'
+    assert safe["ok"] == 1
+    assert safe["nan_value"] is None
+    assert safe["nested"][0] is None
+    assert safe["nested"][1]["neg_inf"] is None
+    assert safe["text"] == "stable"

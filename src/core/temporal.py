@@ -25,6 +25,39 @@ SCHOOL_ROLE = "scolaire"
 LOCAL_WORKER_ROLE = "actif_local"
 COMMUTER_ROLE = "actif_navetteur"
 SENIOR_ROLE = "senior"
+INACTIVE_ROLE = "inactif"
+
+
+def _escort_scoring_config(config: dict) -> dict:
+    household_cfg = config.get('temporal_model', {}).get('household_dynamics', {})
+    scoring_cfg = household_cfg.get('escort_scoring', {})
+    role_weights = scoring_cfg.get('role_weights', {})
+    proximity_cfg = scoring_cfg.get('proximity', {})
+    pickup_cfg = scoring_cfg.get('pickup', {})
+    departure_cfg = scoring_cfg.get('departure_alignment', {})
+
+    return {
+        'role_weights': {
+            SENIOR_ROLE: float(role_weights.get(SENIOR_ROLE, 16.0)),
+            INACTIVE_ROLE: float(role_weights.get(INACTIVE_ROLE, 14.0)),
+            LOCAL_WORKER_ROLE: float(role_weights.get(LOCAL_WORKER_ROLE, 12.0)),
+            COMMUTER_ROLE: float(role_weights.get(COMMUTER_ROLE, 8.0)),
+        },
+        'proximity': {
+            'max_score': float(proximity_cfg.get('max_score', 10.0)),
+            'distance_scale_m': float(proximity_cfg.get('distance_scale_m', 250.0)),
+        },
+        'pickup': {
+            'bonus_if_possible': float(pickup_cfg.get('bonus_if_possible', 20.0)),
+            'bonus_if_not_possible': float(pickup_cfg.get('bonus_if_not_possible', 5.0)),
+        },
+        'departure_alignment': {
+            'bonus_if_no_departure': float(departure_cfg.get('bonus_if_no_departure', 4.0)),
+            'max_bonus_if_departure_after_child': float(
+                departure_cfg.get('max_bonus_if_departure_after_child', 6.0)
+            ),
+        },
+    }
 
 
 def _parse_hour_slot(time_str: str, end: bool = False) -> int:
@@ -229,14 +262,43 @@ def _register_escort_stop(schedule: dict, hour: int | None, destination_id: str,
         stop_hours.append(int(hour))
 
 
-def _guardian_can_pickup_child(guardian_schedule: dict, child_return: int | None, pickup_overlap_hours: int) -> bool:
+def _guardian_can_dropoff_child(guardian_schedule: dict, child_departure: int | None) -> bool:
     guardian_role = guardian_schedule.get('role')
-    guardian_return = guardian_schedule.get('return_hour')
-    if guardian_role in {SENIOR_ROLE, 'inactif'}:
+    if guardian_role in {SENIOR_ROLE, INACTIVE_ROLE}:
         return True
-    if child_return is None or guardian_return is None:
+    if child_departure is None:
         return False
-    return child_return >= (guardian_return - pickup_overlap_hours)
+    guardian_departure = guardian_schedule.get('departure_hour')
+    if guardian_departure is None:
+        return True
+    return guardian_departure >= child_departure
+
+
+def _guardian_can_pickup_child(
+    guardian_schedule: dict,
+    child_departure: int | None,
+    child_return: int | None,
+    pickup_overlap_hours: int,
+) -> bool:
+    guardian_role = guardian_schedule.get('role')
+    if guardian_role in {SENIOR_ROLE, INACTIVE_ROLE}:
+        return child_return is not None
+
+    guardian_departure = guardian_schedule.get('departure_hour')
+    guardian_return = guardian_schedule.get('return_hour')
+    if child_return is None or guardian_departure is None or guardian_return is None:
+        return False
+
+    work_start = min(guardian_departure, guardian_return)
+    work_end = max(guardian_departure, guardian_return)
+    earliest_pickup_hour = max(work_start, work_end - max(0, int(pickup_overlap_hours)))
+    if child_return < earliest_pickup_hour:
+        return False
+
+    if child_departure is not None and child_return < child_departure:
+        return False
+
+    return True
 
 
 def _sync_guardian_departure_with_child(guardian_schedule: dict, child_departure: int | None) -> None:
@@ -249,11 +311,135 @@ def _sync_guardian_departure_with_child(guardian_schedule: dict, child_departure
     guardian_schedule['departure_hour'] = min(guardian_departure, child_departure)
 
 
+def _sync_guardian_return_with_child_pickup(guardian_schedule: dict, child_return: int | None) -> None:
+    if child_return is None:
+        return
+    if guardian_schedule.get('role') in {SENIOR_ROLE, INACTIVE_ROLE}:
+        return
+
+    guardian_departure = guardian_schedule.get('departure_hour')
+    guardian_return = guardian_schedule.get('return_hour')
+    if guardian_return is None:
+        return
+    if guardian_departure is not None and child_return < guardian_departure:
+        return
+
+    guardian_schedule['return_hour'] = min(guardian_return, child_return)
+
+
+def _guardian_school_proximity_score(
+    guardian_schedule: dict,
+    school_id: str,
+    building_lookup: pd.DataFrame,
+    scoring_cfg: dict,
+) -> float:
+    destination_id = guardian_schedule.get('base_destination_id', guardian_schedule.get('destination_id'))
+    destination_id_str = str(destination_id) if destination_id is not None else None
+    if _is_non_internal_destination(destination_id):
+        return 0.0
+    if destination_id_str not in building_lookup.index or school_id not in building_lookup.index:
+        return 0.0
+
+    school_centroid = building_lookup.loc[school_id].geometry.centroid
+    destination_centroid = building_lookup.loc[destination_id_str].geometry.centroid
+    distance_m = float(school_centroid.distance(destination_centroid))
+    max_score = float(scoring_cfg['proximity']['max_score'])
+    scale_m = max(1e-6, float(scoring_cfg['proximity']['distance_scale_m']))
+    return max(0.0, max_score - (distance_m / scale_m))
+
+
+def _guardian_feasibility_score(
+    member: dict,
+    guardian_schedule: dict,
+    school_id: str,
+    child_departure: int | None,
+    child_return: int | None,
+    pickup_overlap_hours: int,
+    building_lookup: pd.DataFrame,
+    scoring_cfg: dict,
+) -> float | None:
+    if member.get('role') not in {LOCAL_WORKER_ROLE, COMMUTER_ROLE, SENIOR_ROLE, INACTIVE_ROLE}:
+        return None
+    if not _guardian_can_dropoff_child(guardian_schedule, child_departure):
+        return None
+
+    can_pickup = _guardian_can_pickup_child(
+        guardian_schedule,
+        child_departure,
+        child_return,
+        pickup_overlap_hours,
+    )
+    role_score = float(scoring_cfg['role_weights'].get(member.get('role'), 0.0))
+    score = role_score + _guardian_school_proximity_score(
+        guardian_schedule,
+        school_id,
+        building_lookup,
+        scoring_cfg,
+    )
+    score += (
+        float(scoring_cfg['pickup']['bonus_if_possible'])
+        if can_pickup
+        else float(scoring_cfg['pickup']['bonus_if_not_possible'])
+    )
+
+    guardian_departure = guardian_schedule.get('departure_hour')
+    if child_departure is not None:
+        if guardian_departure is None:
+            score += float(scoring_cfg['departure_alignment']['bonus_if_no_departure'])
+        else:
+            score += min(
+                float(scoring_cfg['departure_alignment']['max_bonus_if_departure_after_child']),
+                max(0.0, float(guardian_departure - child_departure)),
+            )
+
+    return score
+
+
+def _select_guardian_for_child(
+    household: dict,
+    schedules: dict[str, dict],
+    school_id: str,
+    child_departure: int | None,
+    child_return: int | None,
+    pickup_overlap_hours: int,
+    building_lookup: pd.DataFrame,
+    scoring_cfg: dict,
+) -> tuple[str | None, dict | None]:
+    best_guardian_id = None
+    best_score = None
+
+    for member in household.get('members', []):
+        member_id = member.get('member_id')
+        if member_id not in schedules:
+            continue
+        guardian_schedule = schedules[member_id]
+        score = _guardian_feasibility_score(
+            member,
+            guardian_schedule,
+            school_id,
+            child_departure,
+            child_return,
+            pickup_overlap_hours,
+            building_lookup,
+            scoring_cfg,
+        )
+        if score is None:
+            continue
+        if best_score is None or score > best_score:
+            best_score = score
+            best_guardian_id = member_id
+
+    if best_guardian_id is None:
+        return None, None
+    return str(best_guardian_id), schedules[best_guardian_id]
+
+
 def _school_id_for_child_schedule(child_schedule: dict, building_lookup: pd.DataFrame) -> str | None:
     school_id = child_schedule.get('destination_id')
-    if _is_non_internal_destination(school_id) or school_id not in building_lookup.index:
+    school_id_str = str(school_id) if school_id is not None else None
+    if _is_non_internal_destination(school_id) or school_id_str not in building_lookup.index:
         return None
-    return str(school_id)
+    return school_id_str
 
 
 def _school_distance(home_centroid, school_id: str, building_lookup: pd.DataFrame) -> float:
@@ -263,13 +449,14 @@ def _school_distance(home_centroid, school_id: str, building_lookup: pd.DataFram
 
 def _apply_child_school_constraint(
     member: dict,
+    household: dict,
+    schedules: dict[str, dict],
     child_schedule: dict,
-    guardian_id: str | None,
-    guardian_schedule: dict | None,
     walk_max_distance: float,
     pickup_overlap_hours: int,
     home_centroid,
     building_lookup: pd.DataFrame,
+    scoring_cfg: dict,
 ) -> None:
     if not child_schedule.get('enabled', True):
         child_schedule['school_access_status'] = 'inactive'
@@ -288,21 +475,34 @@ def _apply_child_school_constraint(
         child_schedule['school_access_status'] = 'walk'
         return
 
+    child_departure = child_schedule.get('departure_hour')
+    child_return = child_schedule.get('return_hour')
+    guardian_id, guardian_schedule = _select_guardian_for_child(
+        household=household,
+        schedules=schedules,
+        school_id=school_id,
+        child_departure=child_departure,
+        child_return=child_return,
+        pickup_overlap_hours=pickup_overlap_hours,
+        building_lookup=building_lookup,
+        scoring_cfg=scoring_cfg,
+    )
+
     if guardian_schedule is None or guardian_id is None:
         child_schedule['escort_mode'] = 'unverified'
-        child_schedule['school_access_status'] = 'unverified_far'
+        child_schedule['school_access_status'] = 'unverified_far_no_guardian'
         return
 
     child_schedule['escort_mode'] = 'escort'
     child_schedule['school_access_status'] = 'escort'
     child_schedule['escort_guardian_id'] = guardian_id
 
-    child_departure = child_schedule.get('departure_hour')
-    child_return = child_schedule.get('return_hour')
-
     _register_escort_stop(guardian_schedule, child_departure, school_id, member['member_id'], 'dropoff')
-    if _guardian_can_pickup_child(guardian_schedule, child_return, pickup_overlap_hours):
+    if _guardian_can_pickup_child(guardian_schedule, child_departure, child_return, pickup_overlap_hours):
         _register_escort_stop(guardian_schedule, child_return, school_id, member['member_id'], 'pickup')
+        _sync_guardian_return_with_child_pickup(guardian_schedule, child_return)
+    else:
+        child_schedule['school_access_status'] = 'escort_dropoff_only'
     _sync_guardian_departure_with_child(guardian_schedule, child_departure)
 
 
@@ -317,10 +517,9 @@ def _apply_household_constraints(
     if not household_cfg.get('enable_school_escort', False):
         return
 
-    guardian_id = household.get('guardian_member_id')
-    guardian_schedule = schedules.get(guardian_id) if guardian_id else None
     walk_max_distance = float(household_cfg.get('school_walk_max_distance_m', 1200))
     pickup_overlap_hours = int(household_cfg.get('school_pickup_overlap_hours', 1))
+    scoring_cfg = _escort_scoring_config(config)
 
     for member in household['members']:
         if member['role'] != SCHOOL_ROLE:
@@ -329,13 +528,14 @@ def _apply_household_constraints(
         child_schedule = schedules[member['member_id']]
         _apply_child_school_constraint(
             member,
+            household,
+            schedules,
             child_schedule,
-            guardian_id,
-            guardian_schedule,
             walk_max_distance,
             pickup_overlap_hours,
             home_centroid,
             building_lookup,
+            scoring_cfg,
         )
 
 
@@ -368,9 +568,22 @@ def _assign_presence(
 
 
 def _school_destination_for_hour(schedule: dict, hour: int) -> str:
-    if schedule['enabled'] and not _is_non_internal_destination(schedule['destination_id']):
+    if not schedule.get('enabled', True):
+        return HOME_DESTINATION
+
+    destination_id = schedule.get('destination_id')
+    if _is_outside_destination(destination_id):
+        departure_hour = schedule.get('departure_hour')
+        return_hour = schedule.get('return_hour')
+        if departure_hour is None or return_hour is None:
+            return HOME_DESTINATION
+        if departure_hour <= hour <= return_hour:
+            return "EXTERIEUR"
+        return HOME_DESTINATION
+
+    if not _is_non_internal_destination(destination_id):
         if hour in schedule.get('school_presence_hours', []):
-            return schedule['destination_id']
+            return destination_id
     return HOME_DESTINATION
 
 
@@ -547,7 +760,9 @@ def _restaurant_destinations_by_hour(df: gpd.GeoDataFrame) -> dict[int, list[str
 def _building_lookup(df: gpd.GeoDataFrame) -> pd.DataFrame:
     if 'building_id' not in df.columns:
         return pd.DataFrame()
-    return df.set_index('building_id')
+    lookup = df.copy()
+    lookup['building_id'] = lookup['building_id'].astype(str)
+    return lookup.set_index('building_id')
 
 
 def _household_schedules(household: dict, config: dict, rng: np.random.Generator) -> dict[str, dict]:

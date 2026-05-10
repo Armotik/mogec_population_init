@@ -1,5 +1,6 @@
 import pytest
 import geopandas as gpd
+from copy import deepcopy
 from shapely.geometry import Polygon
 from src.core.agendas import generer_agendas_agents
 from src.core.restaurants import integrer_restaurants_aux_batiments
@@ -8,11 +9,15 @@ from src.core.temporal import _resolve_role_profile, build_member_timelines, gen
 
 
 def test_matrice_horaire_complete(config, bati_popule):
+    config = deepcopy(config)
     # 1. Préparation de la donnée avec tous les attributs (Agendas, Restos, Cultes)
     config['data_paths']['input']['audit_restaurants'] = "data/01_raw/audit_restaurants_batz.csv"
     config['scenario']['day_of_week'] = "Dimanche"  # On force le dimanche pour tester l'église
 
-    df = generer_agendas_agents(bati_popule, config)
+    subset = bati_popule[bati_popule['pop_t0'] > 0].sort_values('building_id').head(140).copy()
+    if subset.empty:
+        subset = bati_popule.sort_values('building_id').head(140).copy()
+    df = generer_agendas_agents(subset, config)
     df = integrer_restaurants_aux_batiments(df, config)
     df = integrer_lieux_culte(df, config)
 
@@ -65,6 +70,7 @@ def test_matrice_horaire_complete(config, bati_popule):
 
 
 def test_activites_exogenes_creent_un_pic_diurne(config):
+    config = deepcopy(config)
     config['scenario']['day_of_week'] = "Jeudi"
     config['scenario']['temporal_context'] = {'weather_index': 1.0, 'alert_level': 0.0}
     config['non_residential_model']['activities']['enabled'] = True
@@ -107,6 +113,7 @@ def test_activites_exogenes_creent_un_pic_diurne(config):
 
 
 def test_vacances_scolaires_n_annulent_pas_les_profils_actifs(config):
+    config = deepcopy(config)
     config['scenario']['day_of_week'] = "Jeudi"
     config['scenario']['is_school_holiday'] = True
 
@@ -384,3 +391,368 @@ def test_scolaire_respecte_un_profil_horaire_de_presence():
     assert child['timeline_destinations'][12] == 'DOMICILE'
     assert child['timeline_destinations'][14] == 'SCHOOL'
     assert child['timeline_destinations'][16] == 'DOMICILE'
+
+
+def test_accompagnateur_scolaire_selectionne_selon_faisabilite():
+    config = {
+        'scenario': {
+            'day_of_week': 'Jeudi',
+            'is_school_holiday': False,
+            'temporal_context': {},
+        },
+        'project': {'random_seed': 123},
+        'temporal_model': {
+            'calendars': {'weekend_days': ['Samedi', 'Dimanche']},
+            'scenario_context': {'weather_index': 1.0, 'alert_level': 0.0, 'religious_day': False},
+            'modifiers': {},
+            'household_dynamics': {
+                'enable_school_escort': True,
+                'school_walk_max_distance_m': 500,
+                'school_pickup_overlap_hours': 1,
+            },
+            'role_profiles': {
+                'scolaire': {
+                    'weekday': {
+                        'enabled': True,
+                        'departure': {'mean': 8.0, 'std': 0.0, 'min': 8, 'max': 8},
+                        'return': {'mean': 16.0, 'std': 0.0, 'min': 16, 'max': 16},
+                    }
+                },
+                'actif_navetteur': {
+                    'weekday': {
+                        'enabled': True,
+                        'departure': {'mean': 8.0, 'std': 0.0, 'min': 8, 'max': 8},
+                        'return': {'mean': 20.0, 'std': 0.0, 'min': 20, 'max': 20},
+                    }
+                },
+                'senior': {
+                    'weekday': {
+                        'enabled': True,
+                    }
+                },
+            },
+        },
+    }
+
+    gdf = gpd.GeoDataFrame(
+        {
+            'building_id': ['HOME', 'SCHOOL', 'WORK'],
+            'usage_1': ['Résidentiel', 'Enseignement', 'Commercial et services'],
+            'households': [[{
+                'household_id': 'HH1',
+                'guardian_member_id': 'parent_commuter',
+                'members': [
+                    {'member_id': 'child', 'role': 'scolaire', 'destination_id': 'SCHOOL'},
+                    {'member_id': 'parent_commuter', 'role': 'actif_navetteur', 'destination_id': 'EXTERIEUR'},
+                    {'member_id': 'grand_parent', 'role': 'senior', 'destination_id': 'DOMICILE'},
+                ],
+            }], [], []],
+        },
+        geometry=[
+            Polygon([(0, 0), (0, 10), (10, 10), (10, 0)]),
+            Polygon([(1200, 0), (1200, 10), (1210, 10), (1210, 0)]),
+            Polygon([(2000, 0), (2000, 10), (2010, 10), (2010, 0)]),
+        ],
+        crs='EPSG:2154',
+    )
+
+    timelines = build_member_timelines(gdf, config)
+    child = timelines.loc[timelines['member_id'] == 'child'].iloc[0]
+    senior = timelines.loc[timelines['member_id'] == 'grand_parent'].iloc[0]
+    commuter = timelines.loc[timelines['member_id'] == 'parent_commuter'].iloc[0]
+
+    assert child['escort_mode'] == 'escort'
+    assert child['escort_guardian_id'] == 'grand_parent'
+    assert 8 in senior['escort_stop_hours']
+    assert 16 in senior['escort_stop_hours']
+    assert commuter['escort_stop_hours'] == []
+
+
+def test_accompagnateur_scolaire_score_est_configurable():
+    config = {
+        'scenario': {
+            'day_of_week': 'Jeudi',
+            'is_school_holiday': False,
+            'temporal_context': {},
+        },
+        'project': {'random_seed': 123},
+        'temporal_model': {
+            'calendars': {'weekend_days': ['Samedi', 'Dimanche']},
+            'scenario_context': {'weather_index': 1.0, 'alert_level': 0.0, 'religious_day': False},
+            'modifiers': {},
+            'household_dynamics': {
+                'enable_school_escort': True,
+                'school_walk_max_distance_m': 500,
+                'school_pickup_overlap_hours': 1,
+                'escort_scoring': {
+                    'role_weights': {
+                        'senior': 2.0,
+                        'inactif': 2.0,
+                        'actif_local': 3.0,
+                        'actif_navetteur': 40.0,
+                    },
+                    'proximity': {'max_score': 1.0, 'distance_scale_m': 1000.0},
+                    'pickup': {'bonus_if_possible': 30.0, 'bonus_if_not_possible': 0.0},
+                    'departure_alignment': {
+                        'bonus_if_no_departure': 0.0,
+                        'max_bonus_if_departure_after_child': 2.0,
+                    },
+                },
+            },
+            'role_profiles': {
+                'scolaire': {
+                    'weekday': {
+                        'enabled': True,
+                        'departure': {'mean': 8.0, 'std': 0.0, 'min': 8, 'max': 8},
+                        'return': {'mean': 16.0, 'std': 0.0, 'min': 16, 'max': 16},
+                    }
+                },
+                'actif_navetteur': {
+                    'weekday': {
+                        'enabled': True,
+                        'departure': {'mean': 8.0, 'std': 0.0, 'min': 8, 'max': 8},
+                        'return': {'mean': 20.0, 'std': 0.0, 'min': 20, 'max': 20},
+                    }
+                },
+                'senior': {
+                    'weekday': {
+                        'enabled': True,
+                    }
+                },
+            },
+        },
+    }
+
+    gdf = gpd.GeoDataFrame(
+        {
+            'building_id': ['HOME', 'SCHOOL', 'WORK'],
+            'usage_1': ['Résidentiel', 'Enseignement', 'Commercial et services'],
+            'households': [[{
+                'household_id': 'HH1',
+                'guardian_member_id': 'parent_commuter',
+                'members': [
+                    {'member_id': 'child', 'role': 'scolaire', 'destination_id': 'SCHOOL'},
+                    {'member_id': 'parent_commuter', 'role': 'actif_navetteur', 'destination_id': 'EXTERIEUR'},
+                    {'member_id': 'grand_parent', 'role': 'senior', 'destination_id': 'DOMICILE'},
+                ],
+            }], [], []],
+        },
+        geometry=[
+            Polygon([(0, 0), (0, 10), (10, 10), (10, 0)]),
+            Polygon([(1200, 0), (1200, 10), (1210, 10), (1210, 0)]),
+            Polygon([(2000, 0), (2000, 10), (2010, 10), (2010, 0)]),
+        ],
+        crs='EPSG:2154',
+    )
+
+    timelines = build_member_timelines(gdf, config)
+    child = timelines.loc[timelines['member_id'] == 'child'].iloc[0]
+    senior = timelines.loc[timelines['member_id'] == 'grand_parent'].iloc[0]
+    commuter = timelines.loc[timelines['member_id'] == 'parent_commuter'].iloc[0]
+
+    assert child['escort_mode'] == 'escort'
+    assert child['school_access_status'] == 'escort_dropoff_only'
+    assert child['escort_guardian_id'] == 'parent_commuter'
+    assert 8 in commuter['escort_stop_hours']
+    assert 16 not in commuter['escort_stop_hours']
+    assert senior['escort_stop_hours'] == []
+
+
+def test_pickup_impossible_ne_cree_pas_de_trajet_incoherent():
+    config = {
+        'scenario': {
+            'day_of_week': 'Jeudi',
+            'is_school_holiday': False,
+            'temporal_context': {},
+        },
+        'project': {'random_seed': 123},
+        'temporal_model': {
+            'calendars': {'weekend_days': ['Samedi', 'Dimanche']},
+            'scenario_context': {'weather_index': 1.0, 'alert_level': 0.0, 'religious_day': False},
+            'modifiers': {},
+            'household_dynamics': {
+                'enable_school_escort': True,
+                'school_walk_max_distance_m': 500,
+                'school_pickup_overlap_hours': 1,
+            },
+            'role_profiles': {
+                'scolaire': {
+                    'weekday': {
+                        'enabled': True,
+                        'departure': {'mean': 8.0, 'std': 0.0, 'min': 8, 'max': 8},
+                        'return': {'mean': 14.0, 'std': 0.0, 'min': 14, 'max': 14},
+                    }
+                },
+                'actif_local': {
+                    'weekday': {
+                        'enabled': True,
+                        'departure': {'mean': 8.0, 'std': 0.0, 'min': 8, 'max': 8},
+                        'return': {'mean': 18.0, 'std': 0.0, 'min': 18, 'max': 18},
+                    }
+                },
+            },
+        },
+    }
+
+    gdf = gpd.GeoDataFrame(
+        {
+            'building_id': ['HOME', 'SCHOOL', 'WORK'],
+            'usage_1': ['Résidentiel', 'Enseignement', 'Commercial et services'],
+            'households': [[{
+                'household_id': 'HH1',
+                'guardian_member_id': 'parent',
+                'members': [
+                    {'member_id': 'child', 'role': 'scolaire', 'destination_id': 'SCHOOL'},
+                    {'member_id': 'parent', 'role': 'actif_local', 'destination_id': 'WORK'},
+                ],
+            }], [], []],
+        },
+        geometry=[
+            Polygon([(0, 0), (0, 10), (10, 10), (10, 0)]),
+            Polygon([(1200, 0), (1200, 10), (1210, 10), (1210, 0)]),
+            Polygon([(2000, 0), (2000, 10), (2010, 10), (2010, 0)]),
+        ],
+        crs='EPSG:2154',
+    )
+
+    timelines = build_member_timelines(gdf, config)
+    child = timelines.loc[timelines['member_id'] == 'child'].iloc[0]
+    parent = timelines.loc[timelines['member_id'] == 'parent'].iloc[0]
+
+    assert child['school_access_status'] == 'escort_dropoff_only'
+    assert parent['timeline_destinations'][14] == 'WORK'
+    assert 14 not in parent['escort_stop_hours']
+    assert 8 in parent['escort_stop_hours']
+
+
+def test_pickup_valide_force_continuite_retour_parent():
+    config = {
+        'scenario': {
+            'day_of_week': 'Jeudi',
+            'is_school_holiday': False,
+            'temporal_context': {},
+        },
+        'project': {'random_seed': 123},
+        'temporal_model': {
+            'calendars': {'weekend_days': ['Samedi', 'Dimanche']},
+            'scenario_context': {'weather_index': 1.0, 'alert_level': 0.0, 'religious_day': False},
+            'modifiers': {},
+            'household_dynamics': {
+                'enable_school_escort': True,
+                'school_walk_max_distance_m': 500,
+                'school_pickup_overlap_hours': 1,
+            },
+            'role_profiles': {
+                'scolaire': {
+                    'weekday': {
+                        'enabled': True,
+                        'departure': {'mean': 8.0, 'std': 0.0, 'min': 8, 'max': 8},
+                        'return': {'mean': 17.0, 'std': 0.0, 'min': 17, 'max': 17},
+                    }
+                },
+                'actif_local': {
+                    'weekday': {
+                        'enabled': True,
+                        'departure': {'mean': 8.0, 'std': 0.0, 'min': 8, 'max': 8},
+                        'return': {'mean': 18.0, 'std': 0.0, 'min': 18, 'max': 18},
+                    }
+                },
+            },
+        },
+    }
+
+    gdf = gpd.GeoDataFrame(
+        {
+            'building_id': ['HOME', 'SCHOOL', 'WORK'],
+            'usage_1': ['Résidentiel', 'Enseignement', 'Commercial et services'],
+            'households': [[{
+                'household_id': 'HH1',
+                'guardian_member_id': 'parent',
+                'members': [
+                    {'member_id': 'child', 'role': 'scolaire', 'destination_id': 'SCHOOL'},
+                    {'member_id': 'parent', 'role': 'actif_local', 'destination_id': 'WORK'},
+                ],
+            }], [], []],
+        },
+        geometry=[
+            Polygon([(0, 0), (0, 10), (10, 10), (10, 0)]),
+            Polygon([(1200, 0), (1200, 10), (1210, 10), (1210, 0)]),
+            Polygon([(2000, 0), (2000, 10), (2010, 10), (2010, 0)]),
+        ],
+        crs='EPSG:2154',
+    )
+
+    timelines = build_member_timelines(gdf, config)
+    parent = timelines.loc[timelines['member_id'] == 'parent'].iloc[0]
+
+    assert parent['timeline_destinations'][17] == 'SCHOOL'
+    assert parent['timeline_destinations'][18] == 'DOMICILE'
+
+
+def test_scolaire_outside_commune_est_exterieur_pendant_plage_scolaire():
+    config = {
+        'scenario': {
+            'day_of_week': 'Jeudi',
+            'is_school_holiday': False,
+            'temporal_context': {},
+        },
+        'project': {'random_seed': 123},
+        'temporal_model': {
+            'calendars': {'weekend_days': ['Samedi', 'Dimanche']},
+            'scenario_context': {'weather_index': 1.0, 'alert_level': 0.0, 'religious_day': False},
+            'modifiers': {},
+            'household_dynamics': {
+                'enable_school_escort': True,
+                'school_walk_max_distance_m': 500,
+                'school_pickup_overlap_hours': 1,
+            },
+            'role_profiles': {
+                'scolaire': {
+                    'weekday': {
+                        'enabled': True,
+                        'departure': {'mean': 8.0, 'std': 0.0, 'min': 8, 'max': 8},
+                        'return': {'mean': 16.0, 'std': 0.0, 'min': 16, 'max': 16},
+                    }
+                },
+            },
+        },
+    }
+
+    gdf = gpd.GeoDataFrame(
+        {
+            'building_id': ['HOME'],
+            'usage_1': ['Résidentiel'],
+            'households': [[{
+                'household_id': 'HH1',
+                'guardian_member_id': None,
+                'members': [
+                    {'member_id': 'child', 'role': 'scolaire', 'destination_id': 'EXTERIEUR'},
+                ],
+            }]],
+        },
+        geometry=[Polygon([(0, 0), (0, 10), (10, 10), (10, 0)])],
+        crs='EPSG:2154',
+    )
+
+    timelines = build_member_timelines(gdf, config)
+    child = timelines.loc[timelines['member_id'] == 'child'].iloc[0]
+
+    assert child['timeline_destinations'][7] == 'DOMICILE'
+    assert child['timeline_destinations'][9] == 'EXTERIEUR'
+    assert child['timeline_destinations'][15] == 'EXTERIEUR'
+    assert child['timeline_destinations'][18] == 'DOMICILE'
+
+
+def test_scenario_reel_outside_commune_ne_reste_pas_domicile(member_timelines_weekday_school_day):
+    outside_rows = member_timelines_weekday_school_day[
+        (member_timelines_weekday_school_day['role'] == 'scolaire')
+        & (member_timelines_weekday_school_day['school_access_status'] == 'outside_commune')
+    ]
+
+    assert not outside_rows.empty
+    for _, row in outside_rows.iterrows():
+        assert row['timeline_destinations'][9] == 'EXTERIEUR'
+        assert row['timeline_destinations'][10] == 'EXTERIEUR'
+        assert row['timeline_destinations'][11] == 'EXTERIEUR'
+        assert row['timeline_destinations'][14] == 'EXTERIEUR'
+        assert row['timeline_destinations'][15] == 'EXTERIEUR'

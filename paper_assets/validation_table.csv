@@ -1,0 +1,14 @@
+dimension,indicator,value,status,source
+Export,Entites exportees,4779,info,structural_quality_report
+Export,Colonnes horaires,24,pass,structural_quality_report
+Traçabilite,building_id dupliques,0,pass,structural_quality_report
+Geometrie,Geometries nulles,0,pass,structural_quality_report
+Bornes,Valeurs horaires negatives,0,pass,structural_quality_report
+T0,Population T0,3726,info,summarize_export_metrics
+T0,Ecart pop_t0 vs heure reference,0,pass,summarize_export_metrics
+Temporalite,Population horaire min,2615,info,hourly_population_profile
+Temporalite,Population horaire max,3726,info,hourly_population_profile
+Roles,Ecart max cible/realise (pp),0.0,pass,role_targets_vs_realized
+Presence exogene,Agents hebergement touristique,53,info,non_residential_validation
+Proxy,Emplois locaux modelises/reference,578/578,pass,external_proxy_validation
+Proxy,Hebergement modelise<=capacite,53<=526,pass,external_proxy_validation

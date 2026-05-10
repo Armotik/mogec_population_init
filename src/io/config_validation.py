@@ -12,6 +12,7 @@ type JSON Schema ou Pydantic, mais avec des garanties explicites :
 from __future__ import annotations
 
 from collections.abc import Mapping
+from pathlib import Path
 
 SUPPORTED_PROXY_METRICS = {
     'member_state_share',
@@ -169,11 +170,15 @@ def _validate_study_area_section(study_area: dict) -> None:
         'boundary_name_value',
         'department_code',
         'buffer_m',
+        'allow_network_fallback',
     }
-    _ensure_allowed_keys(study_area, 'study_area', allowed, allowed)
-    for key in allowed - {'buffer_m'}:
+    required = allowed - {'allow_network_fallback'}
+    _ensure_allowed_keys(study_area, 'study_area', allowed, required)
+    for key in required - {'buffer_m'}:
         _ensure_string(study_area[key], f'study_area.{key}')
     _ensure_number(study_area['buffer_m'], 'study_area.buffer_m', minimum=0.0)
+    if 'allow_network_fallback' in study_area:
+        _ensure_bool(study_area['allow_network_fallback'], 'study_area.allow_network_fallback')
 
 
 def _validate_data_paths_section(data_paths: dict) -> None:
@@ -334,12 +339,100 @@ def _validate_temporal_model_section(temporal_model: dict) -> None:
     _ensure_allowed_keys(
         household_dynamics,
         'temporal_model.household_dynamics',
-        {'enable_school_escort', 'school_walk_max_distance_m', 'school_pickup_overlap_hours'},
+        {'enable_school_escort', 'school_walk_max_distance_m', 'school_pickup_overlap_hours', 'escort_scoring'},
         {'enable_school_escort', 'school_walk_max_distance_m', 'school_pickup_overlap_hours'},
     )
     _ensure_bool(household_dynamics['enable_school_escort'], 'temporal_model.household_dynamics.enable_school_escort')
     _ensure_number(household_dynamics['school_walk_max_distance_m'], 'temporal_model.household_dynamics.school_walk_max_distance_m', minimum=0.0)
     _ensure_int(household_dynamics['school_pickup_overlap_hours'], 'temporal_model.household_dynamics.school_pickup_overlap_hours', minimum=0)
+    if 'escort_scoring' in household_dynamics:
+        escort_scoring = _ensure_mapping(household_dynamics['escort_scoring'], 'temporal_model.household_dynamics.escort_scoring')
+        _ensure_allowed_keys(
+            escort_scoring,
+            'temporal_model.household_dynamics.escort_scoring',
+            {'role_weights', 'proximity', 'pickup', 'departure_alignment'},
+            {'role_weights', 'proximity', 'pickup', 'departure_alignment'},
+        )
+
+        role_weights = _ensure_mapping(
+            escort_scoring['role_weights'],
+            'temporal_model.household_dynamics.escort_scoring.role_weights',
+        )
+        _ensure_allowed_keys(
+            role_weights,
+            'temporal_model.household_dynamics.escort_scoring.role_weights',
+            {'senior', 'inactif', 'actif_local', 'actif_navetteur'},
+            {'senior', 'inactif', 'actif_local', 'actif_navetteur'},
+        )
+        for key, value in role_weights.items():
+            _ensure_number(
+                value,
+                f'temporal_model.household_dynamics.escort_scoring.role_weights.{key}',
+                minimum=0.0,
+            )
+
+        proximity = _ensure_mapping(
+            escort_scoring['proximity'],
+            'temporal_model.household_dynamics.escort_scoring.proximity',
+        )
+        _ensure_allowed_keys(
+            proximity,
+            'temporal_model.household_dynamics.escort_scoring.proximity',
+            {'max_score', 'distance_scale_m'},
+            {'max_score', 'distance_scale_m'},
+        )
+        _ensure_number(
+            proximity['max_score'],
+            'temporal_model.household_dynamics.escort_scoring.proximity.max_score',
+            minimum=0.0,
+        )
+        _ensure_number(
+            proximity['distance_scale_m'],
+            'temporal_model.household_dynamics.escort_scoring.proximity.distance_scale_m',
+            minimum=1e-6,
+        )
+
+        pickup = _ensure_mapping(
+            escort_scoring['pickup'],
+            'temporal_model.household_dynamics.escort_scoring.pickup',
+        )
+        _ensure_allowed_keys(
+            pickup,
+            'temporal_model.household_dynamics.escort_scoring.pickup',
+            {'bonus_if_possible', 'bonus_if_not_possible'},
+            {'bonus_if_possible', 'bonus_if_not_possible'},
+        )
+        _ensure_number(
+            pickup['bonus_if_possible'],
+            'temporal_model.household_dynamics.escort_scoring.pickup.bonus_if_possible',
+            minimum=0.0,
+        )
+        _ensure_number(
+            pickup['bonus_if_not_possible'],
+            'temporal_model.household_dynamics.escort_scoring.pickup.bonus_if_not_possible',
+            minimum=0.0,
+        )
+
+        departure_alignment = _ensure_mapping(
+            escort_scoring['departure_alignment'],
+            'temporal_model.household_dynamics.escort_scoring.departure_alignment',
+        )
+        _ensure_allowed_keys(
+            departure_alignment,
+            'temporal_model.household_dynamics.escort_scoring.departure_alignment',
+            {'bonus_if_no_departure', 'max_bonus_if_departure_after_child'},
+            {'bonus_if_no_departure', 'max_bonus_if_departure_after_child'},
+        )
+        _ensure_number(
+            departure_alignment['bonus_if_no_departure'],
+            'temporal_model.household_dynamics.escort_scoring.departure_alignment.bonus_if_no_departure',
+            minimum=0.0,
+        )
+        _ensure_number(
+            departure_alignment['max_bonus_if_departure_after_child'],
+            'temporal_model.household_dynamics.escort_scoring.departure_alignment.max_bonus_if_departure_after_child',
+            minimum=0.0,
+        )
 
     role_profiles = _ensure_mapping(temporal_model['role_profiles'], 'temporal_model.role_profiles')
     for role in ['scolaire', 'actif_local', 'actif_navetteur', 'senior']:
@@ -669,3 +762,56 @@ def validate_config_for_evidence(config: dict, require_complete: bool = False) -
         _validate_temporal_proxy_definition(temporal_proxy)
 
     _validate_school_temporal_profiles(config)
+
+
+def _is_local_path(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    stripped = value.strip()
+    if not stripped:
+        return False
+    return "://" not in stripped
+
+
+def validate_config_path_existence(config: dict) -> None:
+    missing_inputs: list[str] = []
+    invalid_outputs: list[str] = []
+
+    study_area = config.get('study_area', {})
+    allow_network_fallback = bool(study_area.get('allow_network_fallback', False))
+    boundary_path = study_area.get('boundary_path')
+    if _is_local_path(boundary_path):
+        boundary_candidate = Path(str(boundary_path)).expanduser()
+        if not boundary_candidate.exists() and not allow_network_fallback:
+            missing_inputs.append(f"study_area.boundary_path -> {boundary_candidate}")
+
+    data_input = config.get('data_paths', {}).get('input', {})
+    for key, value in data_input.items():
+        if key.endswith('_layer') or not _is_local_path(value):
+            continue
+        candidate = Path(str(value)).expanduser()
+        if not candidate.exists():
+            missing_inputs.append(f"data_paths.input.{key} -> {candidate}")
+
+    output_cfg = config.get('data_paths', {}).get('output', {})
+    interim_dir = output_cfg.get('interim_dir')
+    if _is_local_path(interim_dir):
+        interim_candidate = Path(str(interim_dir)).expanduser()
+        if interim_candidate.exists() and not interim_candidate.is_dir():
+            invalid_outputs.append(f"data_paths.output.interim_dir -> {interim_candidate} (n'est pas un dossier)")
+    final_export = output_cfg.get('final_export')
+    if _is_local_path(final_export):
+        parent = Path(str(final_export)).expanduser().parent
+        if not parent.exists():
+            invalid_outputs.append(f"data_paths.output.final_export.parent -> {parent} (dossier parent absent)")
+        elif not parent.is_dir():
+            invalid_outputs.append(f"data_paths.output.final_export.parent -> {parent} (n'est pas un dossier)")
+
+    if missing_inputs:
+        raise ValueError(
+            "Configuration invalide: chemins d'entree introuvables.\n" + "\n".join(missing_inputs)
+        )
+    if invalid_outputs:
+        raise ValueError(
+            "Configuration invalide: chemins de sortie invalides.\n" + "\n".join(invalid_outputs)
+        )

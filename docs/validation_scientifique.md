@@ -1,168 +1,174 @@
-# Validation scientifique et veracite des resultats
+# Validation scientifique et portée des résultats
 
-Ce document sert a distinguer trois choses qu'il ne faut pas melanger dans le memoire :
+Ce document distingue trois niveaux qu'il faut garder séparés dans le mémoire :
 
-1. la coherence technique du pipeline ;
-2. la coherence scientifique interne du scenario ;
-3. la veracite externe du resultat simule.
+1. la cohérence technique de l'export ;
+2. la cohérence interne du scénario ;
+3. la confrontation du modèle à des références externes.
 
-Le projet MOGEC peut demontrer assez fortement les points 1 et 2.
-Le point 3 ne peut pas etre "prouve" uniquement par le modele lui-meme. Il faut une confrontation a des references externes.
+Le projet peut démontrer solidement les deux premiers points. Le troisième demande une comparaison avec des données ou des connaissances extérieures au modèle.
 
-## 1. Ce que le projet peut verifier directement
+## 1. Ce que le projet peut vérifier directement
 
 ### Structure de l'export
 
-Questions a poser :
-- le GeoPackage final est-il complet ?
-- les identifiants sont-ils stables et sans doublon ?
-- les colonnes horaires `pop_h0` a `pop_h23` sont-elles toutes presentes ?
-- des valeurs negatives existent-elles ?
+Questions à poser :
 
-Dans le projet :
+- le GeoPackage final est-il complet ;
+- les identifiants sont-ils stables et sans doublon ;
+- les colonnes `pop_h0` à `pop_h23` sont-elles toutes présentes ;
+- existe-t-il des valeurs négatives ou incohérentes.
+
+Sorties concernées :
+
 - `src/visualization/validation.py::structural_quality_report`
 - `scientific_methodology_checklist`
 
-Interpretation :
-- si ces tests echouent, il ne faut pas discuter de resultat scientifique avant correction ;
-- ce sont des preconditions de validite.
+Interprétation :
 
-### Coherence demographique
+- si ces contrôles échouent, il faut corriger le modèle avant toute discussion scientifique ;
+- ce sont des préconditions de validité.
 
-Questions a poser :
-- la somme des roles reconstruits retombe-t-elle sur `pop_t0` ?
-- les roles realises restent-ils proches des cibles du `config.yaml` ?
+### Cohérence démographique
 
-Dans le projet :
+Questions à poser :
+
+- la somme des rôles reconstruits retombe-t-elle sur `pop_t0` ;
+- les rôles réalisés restent-ils proches des cibles du scénario.
+
+Sorties concernées :
+
 - `role_targets_vs_realized`
 - `scientific_methodology_checklist`
 
-Interpretation :
-- un ecart faible renforce la defendabilite du scenario ;
-- un ecart fort indique soit un parametre mal calibre, soit une logique de generation qui derive par rapport aux cibles.
+Interprétation :
 
-### Coherence temporelle
+- un faible écart renforce la solidité du scénario ;
+- un écart important signale un paramétrage fragile ou une logique de génération à revoir.
 
-Questions a poser :
-- le cycle journalier varie-t-il vraiment ?
-- l'heure de pic et l'heure de creux sont-elles plausibles pour le scenario choisi ?
-- l'amplitude journaliere est-elle compatible avec le recit du territoire ?
+### Cohérence temporelle
 
-Dans le projet :
+Questions à poser :
+
+- le cycle journalier varie-t-il réellement ;
+- les heures de pic et de creux sont-elles compatibles avec le scénario choisi ;
+- l'amplitude journalière reste-t-elle plausible pour le territoire étudié.
+
+Sorties concernées :
+
 - `hourly_population_profile`
 - `plot_scientific_validation_dashboard`
 - `src/visualization/temporal_visu.py`
 
-Interpretation :
-- une serie totalement plate est suspecte ;
-- une dynamique tres forte doit etre justifiee par les hypotheses (navetteurs, tourisme, saison, alerte).
+Interprétation :
 
-### Tracabilite des hypotheses sensibles
+- une série quasi plate doit alerter ;
+- une dynamique très forte doit être justifiée par le scénario, par exemple navettes, tourisme ou saison.
 
-Questions a poser :
-- les briques non residentielles actives sont-elles rattachees a une source identifiable ?
-- la formule est-elle explicite ?
-- la date d'extraction ou de verification est-elle indiquee ?
-- le niveau de confiance est-il declare ?
+### Traçabilité des hypothèses sensibles
 
-Dans le projet :
+Questions à poser :
+
+- chaque brique non résidentielle active renvoie-t-elle à une source identifiable ;
+- la formule utilisée est-elle explicitée ;
+- la date de vérification est-elle indiquée ;
+- le niveau de confiance est-il déclaré.
+
+Sorties concernées :
+
 - `src/io/config_validation.py`
 - `evidence_traceability_report`
 
-Interpretation :
-- sans bloc `evidence`, une hypothese peut etre utile operatoirement mais reste fragile scientifiquement ;
-- un bloc `evidence` complet ne prouve pas que l'hypothese est vraie, mais il rend la methode auditabile.
+Interprétation :
 
-## 2. Ce que la coherence interne ne prouve pas
+- sans bloc `evidence`, une hypothèse peut être utile mais reste fragile scientifiquement ;
+- un bloc `evidence` complet ne prouve pas l'hypothèse, mais rend la méthode plus vérifiable.
 
-Une exportation propre, des roles bien calibres et des courbes lisibles ne suffisent pas a dire :
+## 2. Ce que la cohérence interne ne démontre pas
 
-- que les personnes sont dans les "bons" batiments reellement ;
-- que les heures exactes de depart/retour sont vraies sur le terrain ;
-- que les populations non residentielles sont observees au bon niveau ;
-- que le comportement simule reproduit fidelement une journee reelle.
+Une exportation propre, des rôles bien calibrés et des courbes lisibles ne suffisent pas à affirmer :
 
-Autrement dit :
+- que les personnes sont dans les bons bâtiments réels ;
+- que les heures de départ et de retour sont exactes ;
+- que les populations non résidentielles sont simulées au bon niveau ;
+- que la journée reconstruite reproduit fidèlement une journée observée.
 
-- la coherence interne repond a "le modele fait-il ce qu'il pretend faire ?";
-- la veracite externe repond a "le modele ressemble-t-il suffisamment au monde reel?".
+En pratique :
 
-## 3. Comment commencer une verification externe serieuse
+- la cohérence interne répond à la question « le modèle fait-il ce qu'il annonce ? » ;
+- la confrontation externe répond à la question « le modèle ressemble-t-il suffisamment au territoire réel ? ».
 
-La bonne approche est une validation multi-niveaux.
+## 3. Démarche de confrontation externe
 
-### Niveau A. Ordres de grandeur institutionnels
+La validation la plus solide est progressive.
 
-Comparer le modele a des chiffres de reference independants :
+### Niveau 1. Ordres de grandeur institutionnels
+
+Comparer le modèle à des références indépendantes :
 
 - population communale INSEE ;
-- structure par age ;
+- structure par âge ;
 - part d'actifs travaillant dans la commune ;
-- capacites scolaires ;
-- capacites touristiques ;
-- capacites d'hebergement declarees.
+- capacités scolaires ;
+- capacités touristiques ;
+- capacités d'hébergement déclarées.
 
-But :
-- verifier que le scenario reste dans une enveloppe plausible.
+Objectif : vérifier que le scénario reste dans une enveloppe plausible.
 
-### Niveau B. Validation par composante
+### Niveau 2. Validation par composante
 
-Verifier chaque bloc separatement :
+Examiner séparément chaque bloc :
 
-- residentiel : total population, nombre de batiments habites, densites aberrantes ;
-- scolaire : nombre d'eleves affectes, adequation aux lieux `Enseignement` ;
-- actifs locaux : volume affecte a des destinations internes plausibles ;
+- résidentiel : population totale, bâtiments habités, densités aberrantes ;
+- scolaire : nombre d'élèves affectés, cohérence avec les bâtiments d'enseignement ;
+- actifs locaux : destinations internes plausibles ;
 - navetteurs : baisse diurne compatible avec la structure d'emploi ;
-- hebergement : ordre de grandeur compatible avec les capacites touristiques ;
-- plages : population ajoutee compatible avec la saison et la meteo du scenario.
+- hébergement : ordre de grandeur compatible avec l'offre touristique ;
+- plages : fréquentation cohérente avec la saison et la météo.
 
-But :
-- eviter qu'un bon resultat global masque une composante aberrante.
+Objectif : éviter qu'un résultat global correct masque une composante erronée.
 
-### Niveau C. Validation spatiale
+### Niveau 3. Validation spatiale
 
-Verifier la plausibilite spatiale :
+Vérifier notamment :
 
-- les poles d'arrivee sont-ils des batiments credibles ?
-- des zones importantes du territoire restent-elles vides de facon suspecte ?
-- les plus fortes densites apparaissent-elles la ou cela a du sens ?
+- si les principaux pôles d'arrivée sont crédibles ;
+- si certaines zones restent anormalement vides ;
+- si les plus fortes densités apparaissent dans des secteurs attendus.
 
-But :
-- detecter les erreurs invisibles dans les seuls tableaux agreges.
+Objectif : repérer des erreurs invisibles dans les seuls tableaux agrégés.
 
-### Niveau D. Validation temporelle
+### Niveau 4. Validation temporelle
 
-Verifier la plausibilite des horaires :
+Vérifier notamment :
 
-- le pic nocturne est-il logique ?
-- le creux diurne correspond-il bien a une sortie des navetteurs ou des scolaires ?
-- les reprises de fin de journee sont-elles trop abruptes ?
+- la logique du pic nocturne ;
+- la plausibilité du creux diurne ;
+- la forme de la reprise en fin de journée.
 
-But :
-- confronter le recit temporel du modele a la realite du territoire.
+Objectif : confronter le rythme simulé au rythme attendu du territoire.
 
-### Niveau E. Validation de terrain ou experte
+### Niveau 5. Appui terrain ou expertise locale
 
-Si possible, confronter le modele a :
+Quand c'est possible, confronter le modèle à :
 
-- comptages ponctuels ;
-- observations communales ;
-- expertise locale ;
-- retours d'acteurs du territoire ;
-- documentation d'evenements reels.
+- des comptages ponctuels ;
+- des observations communales ;
+- une expertise locale ;
+- des retours d'acteurs du territoire ;
+- la documentation d'événements réels.
 
-But :
-- sortir du modele auto-referentiel.
+Objectif : sortir d'une validation purement interne au modèle.
 
-## 4. Sorties ajoutees dans le depot
+## 4. Sorties disponibles dans le dépôt
 
-Le script suivant genere un dossier de validation complet :
+Le script suivant génère un dossier de validation complet :
 
 ```bash
 ./.venv/bin/python scripts/generate_scientific_validation.py --config config.yaml
 ```
 
-Sorties produites par defaut dans `data/04_visualization/validation/` :
+Sorties produites par défaut dans `data/04_visualization/validation/` :
 
 - `validation_dashboard.png`
 - `structural_quality.csv`
@@ -175,56 +181,32 @@ Sorties produites par defaut dans `data/04_visualization/validation/` :
 - `scientific_methodology_checklist.csv`
 - `external_proxy_validation.csv`
 
-Ce dernier fichier sert a confronter le modele a des proxys publics deja disponibles dans le projet :
+`external_proxy_validation.csv` sert à confronter le modèle à plusieurs proxys publics déjà mobilisés dans le projet :
 
 - emplois locaux de la commune ;
-- capacites scolaires locales ;
-- capacite touristique retenue.
+- capacités scolaires locales ;
+- capacité touristique retenue.
 
-Attention :
+Pour un scénario marqué `is_school_holiday: true`, le proxy scolaire devient surtout indicatif. Dans ce cas, un statut `info` peut être plus pertinent qu'un `pass`.
 
-- sur un scenario marque `is_school_holiday: true`, le proxy scolaire devient surtout indicatif ;
-- dans ce cas, le statut peut etre `info` plutot que `pass`, pour signaler qu'il ne faut pas sur-interpreter une absence de frequentation scolaire interne.
-
-Un second outil complete cette lecture :
+Deux outils complètent cette lecture :
 
 ```bash
 ./.venv/bin/python scripts/generate_profile_activity_explorer.py --config config.yaml
-```
-
-Il produit `data/04_visualization/profile_activity_explorer.html`, utile pour controler qualitativement les profils, leurs activites et quelques trajectoires individuelles sans passer par un notebook.
-
-Un troisieme script cible la confrontation multi-scenarios a des courbes
-horaires de reference documentees :
-
-```bash
 ./.venv/bin/python scripts/run_proxy_validation.py --config config.yaml
-```
-
-Il produit par defaut :
-
-- `data/04_visualization/proxy_validation/proxy_validation_summary.csv`
-- `data/04_visualization/proxy_validation/proxy_validation_curves.csv`
-
-Voir aussi `docs/proxy_validation.md` pour le schema YAML et la logique de
-comparaison par correlation, RMSE et decalage d'heure de pic.
-
-Pour une lecture plus dynamique, un serveur web local est aussi disponible :
-
-```bash
 ./.venv/bin/python scripts/run_realtime_profile_explorer.py --config config.yaml
 ```
 
-Il permet de suivre un foyer, une personne et les statuts `walk` / `escort` des scolaires sur une carte interactive, y compris en fond satellite.
+Le premier produit une page HTML utile pour lire qualitativement les profils et les activités simulées. Le deuxième compare des courbes simulées à des courbes de référence documentées. Le troisième fournit une interface web locale pour suivre un foyer, une personne et les statuts scolaires sur carte.
 
-## 5. Ligne de defense pour le memoire
+## 5. Formulations utiles pour le mémoire
 
 Formulation robuste :
 
-> Le modele ne pretend pas observer directement la verite terrain. Il produit une reconstruction spatio-temporelle coherente, parametree et tracable, dont la validite est evaluee a la fois par des controles internes, par la traçabilite des hypotheses et par une confrontation progressive a des references externes.
+> Le modèle ne prétend pas observer directement la réalité. Il produit une reconstruction spatio-temporelle cohérente, paramétrée et traçable, dont la validité est appréciée à partir de contrôles internes et d'une confrontation progressive à des références externes.
 
-Formulation a eviter :
+Formulation à éviter :
 
-> Le modele montre la population reelle de Batz-sur-Mer heure par heure.
+> Le modèle montre la population réelle de Batz-sur-Mer heure par heure.
 
-La seconde phrase est trop forte scientifiquement.
+La seconde formulation est trop forte scientifiquement.

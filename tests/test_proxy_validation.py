@@ -1,4 +1,5 @@
 import geopandas as gpd
+from copy import deepcopy
 from shapely.geometry import Polygon
 
 from src.core.proxy_validation import evaluate_temporal_proxies
@@ -221,3 +222,48 @@ def test_evaluate_temporal_proxies_marks_non_applicable_proxy():
     assert summary.iloc[0]["status"] == "info"
     assert "school_holiday_mismatch" in summary.iloc[0]["reason"]
     assert curves.empty
+
+
+def test_proxy_validation_scenario_reel_capture_scolaires_exterieur(
+    config_weekday_school_day,
+    bati_popule_weekday_school_day,
+):
+    config = deepcopy(config_weekday_school_day)
+    config["proxy_validation"] = {
+        "temporal_proxies": [
+            {
+                "proxy_id": "scolaires_exterieur_reel",
+                "label": "Part des scolaires exterieur",
+                "metric": "role_state_share",
+                "role": "scolaire",
+                "state": "exterieur",
+                "comparison_normalization": "none",
+                "reference_curve": [0.0] * 24,
+                "thresholds": {
+                    "correlation_pass_min": 0.0,
+                    "correlation_warn_min": 0.0,
+                    "rmse_pass_max": 1.0,
+                    "rmse_warn_max": 1.0,
+                    "peak_gap_pass_max_hours": 23,
+                    "peak_gap_warn_max_hours": 23,
+                },
+                "evidence": {
+                    "formula": "Part_scolaires_exterieur(t)",
+                    "source_name": "Scenario reel weekday_school_day",
+                    "source_url": "https://example.org/scenario-reel",
+                    "source_file": "",
+                    "extraction_date": "2026-05-08",
+                    "confidence": "medium",
+                },
+            }
+        ]
+    }
+
+    summary, curves = evaluate_temporal_proxies(bati_popule_weekday_school_day, config)
+    exterior_curve = curves[curves["proxy_id"] == "scolaires_exterieur_reel"].sort_values("hour")
+
+    assert len(summary) == 1
+    assert summary.iloc[0]["proxy_id"] == "scolaires_exterieur_reel"
+    assert not exterior_curve.empty
+    assert exterior_curve.loc[exterior_curve["hour"] == 10, "modeled_value"].iloc[0] > 0.0
+    assert exterior_curve.loc[exterior_curve["hour"] == 15, "modeled_value"].iloc[0] > 0.0

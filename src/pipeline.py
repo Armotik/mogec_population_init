@@ -26,7 +26,7 @@ from src.core.restaurants import integrer_restaurants_aux_batiments
 from src.core.schools import integrer_ecoles_aux_batiments
 from src.core.spatial_join import join_buildings_to_grid
 from src.core.temporal import generer_matrice_horaire
-from src.io.config_validation import validate_config_for_evidence
+from src.io.config_validation import validate_config_for_evidence, validate_config_path_existence
 from src.io.exporters import exporter_pour_gama
 from src.io.loaders import load_geopackage_with_mask, load_study_area_boundary
 
@@ -80,7 +80,35 @@ def normalize_config_paths(config: dict, base_dir: str | Path) -> dict:
     return _normalize(config)
 
 
-def load_config(config_path: str | Path = "config.yaml", require_complete_validation: bool = True) -> dict:
+def _load_config_recursive(config_path: Path, inheritance_chain: tuple[Path, ...]) -> dict:
+    resolved_config_path = config_path.resolve()
+    if resolved_config_path in inheritance_chain:
+        cycle = list(inheritance_chain) + [resolved_config_path]
+        cycle_str = " -> ".join(str(path) for path in cycle)
+        raise ValueError(f"Boucle detectee dans les `extends` YAML: {cycle_str}")
+
+    with open(resolved_config_path, 'r', encoding='utf-8') as file:
+        raw_config = yaml.safe_load(file) or {}
+
+    current_config = normalize_config_paths(
+        {key: value for key, value in raw_config.items() if key != 'extends'},
+        resolved_config_path.parent,
+    )
+
+    extends_ref = raw_config.get('extends')
+    if extends_ref is None:
+        return current_config
+
+    base_path = (resolved_config_path.parent / str(extends_ref)).resolve()
+    base_config = _load_config_recursive(base_path, (*inheritance_chain, resolved_config_path))
+    return _deep_merge(base_config, current_config)
+
+
+def load_config(
+    config_path: str | Path = "config.yaml",
+    require_complete_validation: bool = True,
+    require_existing_paths: bool | None = None,
+) -> dict:
     """
     Charge le fichier de configuration principal du projet.
 
@@ -92,6 +120,9 @@ def load_config(config_path: str | Path = "config.yaml", require_complete_valida
         Si `True`, impose la présence de toutes les sections top-level attendues.
         Utile en production. Les tests unitaires de chargeur peuvent le désactiver
         pour valider des fragments de YAML synthétiques.
+    require_existing_paths:
+        Si `True`, vérifie l'existence des chemins configurés (entrées et sorties).
+        Par défaut, suit la valeur de `require_complete_validation`.
 
     Returns
     -------
@@ -99,21 +130,12 @@ def load_config(config_path: str | Path = "config.yaml", require_complete_valida
         Dictionnaire Python prêt à être consommé par les briques du pipeline.
     """
     config_path = Path(config_path)
-    with open(config_path, 'r', encoding='utf-8') as file:
-        raw_config = yaml.safe_load(file) or {}
-
-    if 'extends' in raw_config:
-        base_path = (config_path.parent / raw_config['extends']).resolve()
-        base_config = load_config(base_path, require_complete_validation=False)
-        current_config = normalize_config_paths(
-            {key: value for key, value in raw_config.items() if key != 'extends'},
-            config_path.parent,
-        )
-        config = _deep_merge(base_config, current_config)
-    else:
-        config = normalize_config_paths(raw_config, config_path.parent)
-
+    config = _load_config_recursive(config_path, ())
     validate_config_for_evidence(config, require_complete=require_complete_validation)
+    if require_existing_paths is None:
+        require_existing_paths = require_complete_validation
+    if require_existing_paths:
+        validate_config_path_existence(config)
     return config
 
 
@@ -139,7 +161,8 @@ def _prepare_buildings(config: dict, boundary: gpd.GeoDataFrame) -> gpd.GeoDataF
     bati = filter_buildings_by_area(bati, config['filtering']['min_building_area_m2'])
     bati = assign_building_ids(bati, config)
     bati = compute_centroids(bati)
-    return integrer_ecoles_aux_batiments(bati, config)
+    bati = integrer_ecoles_aux_batiments(bati, config)
+    return integrer_lieux_culte(bati, config)
 
 
 def _build_residential_population(
@@ -161,7 +184,6 @@ def _enrich_population_dynamics(pop: gpd.GeoDataFrame, config: dict) -> gpd.GeoD
     pop = ajouter_zones_plage_exogenes(pop, config)
     pop = generer_agendas_agents(pop, config)
     pop = integrer_restaurants_aux_batiments(pop, config)
-    pop = integrer_lieux_culte(pop, config)
     return generer_matrice_horaire(pop, config)
 
 
@@ -172,11 +194,11 @@ def run_pipeline(config: dict) -> gpd.GeoDataFrame:
     Étapes réalisées
     ----------------
     1. Chargement des frontières d'étude avec et sans buffer.
-    2. Lecture et filtrage des bâtiments.
+    2. Lecture du bâti, filtrage géométrique et marquage écoles/culte.
     3. Jointure au carroyage Filosofi et ventilation de `pop_t0`.
     4. Nettoyage strict aux limites communales.
     5. Profilage sociodémographique et génération d'agendas.
-    6. Intégration des restaurants et lieux de culte.
+    6. Intégration des restaurants.
     7. Construction des colonnes `pop_h0` à `pop_h23`.
 
     Returns

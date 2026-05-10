@@ -40,6 +40,39 @@ def calculer_capacite_residentielle(row, fallback_sqm: float) -> float:
     return float(capacite_estimee)
 
 
+def _target_population_for_carreau(group: pd.DataFrame, modulateur_temporel: float) -> int:
+    ind_values = group['ind'].dropna()
+    if ind_values.empty:
+        return 0
+    return int(round(float(ind_values.iloc[0]) * modulateur_temporel))
+
+
+def _redistribute_missing_population(
+    gdf: gpd.GeoDataFrame,
+    eligible_mask: pd.Series,
+    missing_population: int,
+) -> gpd.GeoDataFrame:
+    if missing_population <= 0:
+        return gdf
+
+    pool = gdf.loc[eligible_mask, 'capacite_logts'].fillna(0.0).astype(float)
+    total_capacity = float(pool.sum())
+    if pool.empty or total_capacity <= 0:
+        raise ValueError(
+            "Aucune capacite residentielle eligible pour redistribuer la population exclue des batiments de culte."
+        )
+
+    weighted = (missing_population * pool / total_capacity)
+    base_allocation = np.floor(weighted).astype(int)
+    remainder = int(missing_population - int(base_allocation.sum()))
+    if remainder > 0:
+        extra_indices = (weighted - base_allocation).nlargest(remainder).index
+        base_allocation.loc[extra_indices] += 1
+
+    gdf.loc[base_allocation.index, 'pop_t0'] = gdf.loc[base_allocation.index, 'pop_t0'] + base_allocation
+    return gdf
+
+
 def ventiler_population_residentielle(jointure_gdf: gpd.GeoDataFrame, config: dict) -> gpd.GeoDataFrame:
     """
     Applique la formule de descente d'échelle dasymétrique pour les bâtiments résidentiels.
@@ -67,7 +100,13 @@ def ventiler_population_residentielle(jointure_gdf: gpd.GeoDataFrame, config: di
     fallback_sqm = config['filtering']['fallback_sqm_per_dwelling']
 
     gdf = jointure_gdf.copy()
-    is_residentiel = gdf['usage_1'].str.lower().str.contains('résidentiel|residentiel', na=False)
+    is_residentiel_brut = gdf['usage_1'].str.lower().str.contains('résidentiel|residentiel', na=False)
+    is_residentiel = is_residentiel_brut.copy()
+    excluded_culte_residential = pd.Series(False, index=gdf.index)
+    if 'is_culte' in gdf.columns:
+        culte_household_allowed = gdf.get('culte_household_allowed', True)
+        is_residentiel = is_residentiel & (~gdf['is_culte'] | culte_household_allowed)
+        excluded_culte_residential = is_residentiel_brut & ~is_residentiel
     gdf['pop_t0'] = 0
 
     # 2. Calcul des capacités
@@ -114,8 +153,28 @@ def ventiler_population_residentielle(jointure_gdf: gpd.GeoDataFrame, config: di
         # On injecte le résultat final dans le DataFrame
         gdf.loc[group.index, 'pop_t0'] = parts_entieres
 
+    # 5. Conservation de masse en cas d'exclusion culte sans bâti résidentiel alternatif local.
+    # Certains carreaux peuvent n'avoir que du résidentiel classé culte non autorisé :
+    # la population cible du carreau doit alors être redistribuée sur le reste du
+    # parc résidentiel éligible pour ne pas créer de perte globale artificielle.
+    missing_due_to_culte = 0
+    if excluded_culte_residential.any():
+        for _, group in gdf.groupby('idcar_200m'):
+            if not excluded_culte_residential.loc[group.index].any():
+                continue
+            if mask_valide.loc[group.index].any():
+                continue
+            missing_due_to_culte += _target_population_for_carreau(group, modulateur_temporel)
+
+    if missing_due_to_culte > 0:
+        logger.warning(
+            "Redistribution de %s agent(s) excludes du residentiel culte vers le parc residentiel eligible.",
+            missing_due_to_culte,
+        )
+        gdf = _redistribute_missing_population(gdf, mask_valide, missing_due_to_culte)
+
     # Nettoyage de la colonne temporaire
-    gdf = gdf.drop(columns=['pop_float', 'capacite_logts', 'somme_capacite_carreau'])
+    gdf = gdf.drop(columns=['pop_float', 'capacite_logts', 'somme_capacite_carreau'], errors='ignore')
 
     population_totale = gdf['pop_t0'].sum()
     logger.info(f"Ventilation terminée : {population_totale} agents placés.")

@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT_DIR="${MOGEC_ROOT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+CHECKSUM_FILE="${MOGEC_CHECKSUM_FILE:-$ROOT_DIR/docs/open_data_checksums.sha256}"
+SKIP_DOWNLOADS="${MOGEC_SKIP_DOWNLOADS:-0}"
+SKIP_UNZIP="${MOGEC_SKIP_UNZIP:-0}"
 
 mkdir -p \
   "$ROOT_DIR/data/01_raw/tourisme_pdl" \
@@ -9,20 +12,61 @@ mkdir -p \
   "$ROOT_DIR/data/01_raw/economie" \
   "$ROOT_DIR/data/01_raw/insee_tourisme"
 
+if [[ ! -f "$CHECKSUM_FILE" ]]; then
+  echo "Checksum manifest not found: $CHECKSUM_FILE" >&2
+  exit 1
+fi
+
+verify_checksum() {
+  local output="$1"
+  local rel_path="${output#"$ROOT_DIR"/}"
+  local expected
+  expected="$(awk -v path="$rel_path" '$2 == path {print $1}' "$CHECKSUM_FILE")"
+  if [[ -z "$expected" ]]; then
+    echo "Missing checksum entry for $rel_path in $CHECKSUM_FILE" >&2
+    exit 1
+  fi
+  local actual
+  actual="$(sha256sum "$output" | awk '{print $1}')"
+  if [[ "$actual" != "$expected" ]]; then
+    echo "Checksum mismatch for $rel_path" >&2
+    echo "Expected: $expected" >&2
+    echo "Actual:   $actual" >&2
+    exit 1
+  fi
+}
+
 download() {
   local url="$1"
   local output="$2"
-  echo "Downloading $(basename "$output")"
-  curl -L --fail --retry 3 --retry-delay 2 -o "$output" "$url"
+  if [[ "$SKIP_DOWNLOADS" == "1" ]]; then
+    echo "Skipping download for $(basename "$output")"
+  else
+    echo "Downloading $(basename "$output")"
+    curl -L --fail --retry 3 --retry-delay 2 -o "$output" "$url"
+  fi
+  if [[ ! -f "$output" ]]; then
+    echo "Required file not found after download phase: $output" >&2
+    exit 1
+  fi
+  verify_checksum "$output"
 }
 
 download_optional() {
   local url="$1"
   local output="$2"
-  echo "Downloading optional $(basename "$output")"
-  if ! curl -L --fail --retry 3 --retry-delay 2 -o "$output" "$url"; then
-    echo "Warning: optional download failed for $(basename "$output")" >&2
-    rm -f "$output"
+  if [[ "$SKIP_DOWNLOADS" == "1" ]]; then
+    echo "Skipping optional download for $(basename "$output")"
+  else
+    echo "Downloading optional $(basename "$output")"
+    if ! curl -L --fail --retry 3 --retry-delay 2 -o "$output" "$url"; then
+      echo "Warning: optional download failed for $(basename "$output")" >&2
+      rm -f "$output"
+      return 0
+    fi
+  fi
+  if [[ -f "$output" ]]; then
+    verify_checksum "$output"
   fi
 }
 
@@ -52,12 +96,14 @@ download_optional "https://www.insee.fr/fr/statistiques/fichier/8742829/pa_ina_1
 # - BPE : le lien de ressource courant doit être ré-identifié sur data.gouv.
 # - SIRENE : le dump national est très volumineux et mérite une stratégie filtrée.
 
-rm -rf "$ROOT_DIR/data/01_raw/plages/plages_sable_loire_atlantique"
-mkdir -p "$ROOT_DIR/data/01_raw/plages/plages_sable_loire_atlantique"
-unzip -o "$ROOT_DIR/data/01_raw/plages/plages_sable_loire_atlantique.zip" -d "$ROOT_DIR/data/01_raw/plages/plages_sable_loire_atlantique" >/dev/null
+if [[ "$SKIP_UNZIP" != "1" ]]; then
+  rm -rf "$ROOT_DIR/data/01_raw/plages/plages_sable_loire_atlantique"
+  mkdir -p "$ROOT_DIR/data/01_raw/plages/plages_sable_loire_atlantique"
+  unzip -o "$ROOT_DIR/data/01_raw/plages/plages_sable_loire_atlantique.zip" -d "$ROOT_DIR/data/01_raw/plages/plages_sable_loire_atlantique" >/dev/null
 
-rm -rf "$ROOT_DIR/data/01_raw/insee_tourisme/capacites_hebergements_touristiques"
-mkdir -p "$ROOT_DIR/data/01_raw/insee_tourisme/capacites_hebergements_touristiques"
-unzip -o "$ROOT_DIR/data/01_raw/insee_tourisme/capacites_hebergements_touristiques.zip" -d "$ROOT_DIR/data/01_raw/insee_tourisme/capacites_hebergements_touristiques" >/dev/null
+  rm -rf "$ROOT_DIR/data/01_raw/insee_tourisme/capacites_hebergements_touristiques"
+  mkdir -p "$ROOT_DIR/data/01_raw/insee_tourisme/capacites_hebergements_touristiques"
+  unzip -o "$ROOT_DIR/data/01_raw/insee_tourisme/capacites_hebergements_touristiques.zip" -d "$ROOT_DIR/data/01_raw/insee_tourisme/capacites_hebergements_touristiques" >/dev/null
+fi
 
-echo "Downloads completed."
+echo "Downloads completed with checksum verification."

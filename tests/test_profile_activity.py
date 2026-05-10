@@ -63,5 +63,5 @@ def test_export_profile_activity_explorer_creates_html(tmp_path):
 
     assert path.exists()
     content = Path(path).read_text(encoding='utf-8')
-    assert 'Explorateur des profils et activites' in content
+    assert 'Lecture des profils et des activites' in content
     assert 'm1' in content

@@ -77,13 +77,13 @@ Etats supportes :
 Script dedie :
 
 ```bash
-./.venv/bin/python scripts/run_proxy_validation.py --config config.yaml
+./.venv/bin/python main.py proxy-validate --config config.yaml
 ```
 
 Avec plusieurs scenarios explicites :
 
 ```bash
-./.venv/bin/python scripts/run_proxy_validation.py \
+./.venv/bin/python main.py proxy-validate \
   --configs config.yaml config_summer_day.yaml
 ```
 

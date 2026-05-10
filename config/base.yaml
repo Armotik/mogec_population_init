@@ -35,6 +35,7 @@ study_area:
   boundary_name_value: "Batz-sur-Mer"
   department_code: "44"
   buffer_m: 200
+  allow_network_fallback: false
 
 # -----------------------------------------------------------------------------
 # 2. DONNÉES D'ENTRÉE, DE SORTIE ET PRÉPARATION EXTERNE
@@ -176,6 +177,21 @@ temporal_model:
     enable_school_escort: true
     school_walk_max_distance_m: 1200
     school_pickup_overlap_hours: 1
+    escort_scoring:
+      role_weights:
+        senior: 16.0
+        inactif: 14.0
+        actif_local: 12.0
+        actif_navetteur: 8.0
+      proximity:
+        max_score: 10.0
+        distance_scale_m: 250.0
+      pickup:
+        bonus_if_possible: 20.0
+        bonus_if_not_possible: 5.0
+      departure_alignment:
+        bonus_if_no_departure: 4.0
+        max_bonus_if_departure_after_child: 6.0
   role_profiles:
     scolaire:
       weekday:
@@ -272,6 +288,9 @@ poi_matching:
       - "Résidentiel"
     allow_fallback_any_usage: true
     concat_multiple_names: true
+    # `evidence` documente d'ou vient l'hypothese ou l'audit utilise ici.
+    # Dans ce bloc, il sert surtout de trace documentaire pour le projet.
+    # Il n'est pas utilise pour modifier les calculs de matching restaurant.
     evidence:
       source_name: "Audit restaurants OSM"
       source_file: "../data/01_raw/audit_restaurants_batz.csv"
@@ -297,6 +316,13 @@ non_residential_model:
         - "locative"
       warn_source_types_on_residential:
         - "residence"
+    # `evidence` ne change pas le resultat numerique de la simulation.
+    # Il sert a :
+    # - justifier la formule et la source retenues ;
+    # - bloquer le chargement si une brique non residentielle activee n'est pas documentee ;
+    # - alimenter les tableaux de tracabilite dans les sorties de validation.
+    # Champs minimaux attendus par le code : formula, source_name, extraction_date,
+    # confidence, et au moins une source tracable via source_url ou source_file.
     evidence:
       formula: "Pop_hebergement = Capacite_lits * tau_occupation * alpha_tourist_t0"
       source_name: "DATAtourisme Pays de la Loire + Insee Capacites 2026"
@@ -358,6 +384,9 @@ non_residential_model:
         client_ratio: 0.5
         alpha_t0: 0.0
         hourly_profile: "equipement_day"
+    # Meme role que pour `accommodation` :
+    # la brique reste calculatoire, mais `evidence` sert a expliciter et tracer
+    # l'hypothese retenue dans la configuration.
     evidence:
       formula: "Pop_activite(t) = (surface / sqm_per_person) * (1 + client_ratio) * alpha_activite(t)"
       source_name: "Hypothese de modelisation des activites diurnes"
@@ -389,6 +418,8 @@ non_residential_model:
         end: 19
         alpha: 0.7
     other_hours_alpha: 0.1
+    # A renseigner des qu'une brique plage est activee dans un scenario.
+    # Sans `evidence` complet, le chargement de la configuration echoue.
     evidence:
       formula: "Pop_plage = Capacite_plage * tau_meteo * alpha_plage(t)"
       source_name: "A renseigner"

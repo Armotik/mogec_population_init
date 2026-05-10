@@ -67,6 +67,13 @@ proxy_validation:
         rmse_warn_max: 0.22
         peak_gap_pass_max_hours: 1
         peak_gap_warn_max_hours: 2
+      # `evidence` decrit ici l'origine scientifique du proxy :
+      # - ce que represente la courbe de reference ;
+      # - d'ou elle vient ;
+      # - avec quel niveau de confiance elle doit etre interpretee.
+      # Le code ne s'en sert pas pour calculer correlation/RMSE, mais pour :
+      # - exiger qu'un proxy actif soit documente ;
+      # - reporter source, date et confiance dans les sorties de validation.
       evidence:
         formula: "Part_navetteurs_exterieur(t) = f(heures de pointe domicile-travail)"
         source_name: "Insee RP2022 ACT T4 + GTFS Destineo Pays de la Loire"
@@ -141,6 +148,64 @@ proxy_validation:
         processing_note: "Le proxy vise la forme horaire d'occupation scolaire, pas un effectif instantane exact."
         confidence: "medium"
         uncertainty_note: "Les horaires peuvent varier selon classe, garderie, restauration et activites periscolaires."
+
+    - proxy_id: "scolaires_exterieur_weekday"
+      label: "Part des scolaires hors commune en jour scolaire"
+      metric: "role_state_share"
+      role: "scolaire"
+      state: "exterieur"
+      comparison_normalization: "none"
+      reference_curve:
+        0: 0.00
+        1: 0.00
+        2: 0.00
+        3: 0.00
+        4: 0.00
+        5: 0.00
+        6: 0.00
+        7: 0.00
+        8: 0.05
+        9: 0.08
+        10: 0.08
+        11: 0.08
+        12: 0.02
+        13: 0.03
+        14: 0.08
+        15: 0.08
+        16: 0.06
+        17: 0.00
+        18: 0.00
+        19: 0.00
+        20: 0.00
+        21: 0.00
+        22: 0.00
+        23: 0.00
+      applicability:
+        day_types:
+          - "weekday"
+        school_holidays:
+          - false
+      thresholds:
+        correlation_pass_min: 0.30
+        correlation_warn_min: 0.10
+        rmse_pass_max: 0.30
+        rmse_warn_max: 0.45
+        peak_gap_pass_max_hours: 3
+        peak_gap_warn_max_hours: 5
+      evidence:
+        formula: "Part_scolaires_exterieur(t) = scolaires assigns EXTERIEUR / total scolaires"
+        source_name: "Proxy interne scenario scolaire Batz-sur-Mer"
+        source_type: "model_internal_proxy"
+        source_url: "https://example.org/proxy-scolaires-exterieur"
+        source_file: ""
+        extraction_date: "2026-05-08"
+        spatial_scope: "Batz-sur-Mer"
+        temporal_scope: "Jour scolaire type"
+        unit: "part des scolaires modelises hors commune"
+        extraction_method: "Courbe de reference faible amplitude pour suivre la population scolaire affectee hors commune."
+        processing_note: "Proxy de suivi de robustesse destine a detecter un retour anormal au domicile en plage scolaire."
+        confidence: "medium"
+        uncertainty_note: "La courbe de reference n'est pas un comptage terrain direct, mais un repere de forme pour controle de cohérence."
 
     - proxy_id: "presence_enseignement_batiments_weekday"
       label: "Charge relative des batiments d'enseignement"

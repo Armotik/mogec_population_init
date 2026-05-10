@@ -1,5 +1,5 @@
 """
-Exploration interactive des profils et des trajectoires individuelles.
+Vue HTML autonome pour lire les profils et les trajectoires simulées.
 """
 
 from __future__ import annotations
@@ -75,7 +75,7 @@ def export_profile_activity_explorer(
     output_path: str | Path,
 ) -> Path:
     """
-    Produit un HTML autonome pour filtrer les profils et suivre un individu.
+    Produit une page HTML autonome pour lire les profils et suivre une personne.
     """
     member_timelines = build_member_timelines(gdf_model, config)
     if member_timelines.empty:
@@ -137,7 +137,7 @@ def export_profile_activity_explorer(
 <html lang="fr">
 <head>
   <meta charset="utf-8">
-  <title>Explorateur des profils MOGEC</title>
+  <title>Lecture des profils MOGEC</title>
   <style>
     :root {{
       --bg: #f7f5ef;
@@ -312,8 +312,8 @@ def export_profile_activity_explorer(
   <div class="page">
     <div class="hero">
       <div>
-        <h1>Explorateur des profils et activites</h1>
-        <p>Scenario <strong>{payload["scenario_name"]}</strong>. Filtre un profil, choisis un individu, puis fais varier l'heure pour suivre sa position et son activite. T0 correspond a h{payload["reference_hour"]:02d}.</p>
+        <h1>Lecture des profils et des activites</h1>
+        <p>Scenario <strong>{payload["scenario_name"]}</strong>. Choisis un profil, selectionne une personne, puis fais varier l'heure pour lire sa situation et son lieu principal. T0 correspond a h{payload["reference_hour"]:02d}.</p>
       </div>
     </div>
 
@@ -325,7 +325,7 @@ def export_profile_activity_explorer(
         <select id="roleSelect"></select>
       </div>
       <div class="card">
-        <label for="memberSelect">Suivre une personne</label>
+        <label for="memberSelect">Choisir une personne</label>
         <select id="memberSelect"></select>
       </div>
       <div class="card">
@@ -337,16 +337,16 @@ def export_profile_activity_explorer(
     <div class="layout">
       <div class="panel-grid">
         <div class="card">
-          <h2>Distribution horaire du profil</h2>
+          <h2>Repartition horaire du profil</h2>
           <div id="profileStack"></div>
           <div class="legend">
             <span class="legend-home">Domicile</span>
-            <span class="legend-interne">Interne commune</span>
+            <span class="legend-interne">Dans la commune</span>
             <span class="legend-exterieur">Hors commune</span>
           </div>
         </div>
         <div class="card">
-          <h2>Journal d'activite individuel</h2>
+          <h2>Chronologie individuelle</h2>
           <table class="timeline-table">
             <thead>
               <tr><th>Heure</th><th>Etat</th><th>Lieu</th><th>Type</th></tr>
@@ -358,14 +358,14 @@ def export_profile_activity_explorer(
 
       <div class="panel-grid">
         <div class="card">
-          <h2>Suivi dynamique</h2>
+          <h2>Repere spatial</h2>
           <div class="track-meta">
             <div><strong>Personne</strong><span id="memberId"></span></div>
             <div><strong>Profil</strong><span id="memberRole"></span></div>
             <div><strong>Domicile</strong><span id="memberHome"></span></div>
             <div><strong>Destination principale</strong><span id="memberDest"></span></div>
-            <div><strong>Etat a l'heure courante</strong><span id="memberState"></span></div>
-            <div><strong>Lieu courant</strong><span id="memberCurrent"></span></div>
+            <div><strong>Situation a l'heure choisie</strong><span id="memberState"></span></div>
+            <div><strong>Lieu a l'heure choisie</strong><span id="memberCurrent"></span></div>
           </div>
           <svg id="trackCanvas" viewBox="0 0 420 320" preserveAspectRatio="xMidYMid meet"></svg>
           <div class="legend">
@@ -529,7 +529,7 @@ def export_profile_activity_explorer(
         note.setAttribute('x', '24');
         note.setAttribute('y', '34');
         note.setAttribute('fill', '#b03a2e');
-        note.textContent = 'Position courante hors commune';
+        note.textContent = 'Position hors commune';
         svg.appendChild(note);
       }}
     }}
@@ -538,7 +538,7 @@ def export_profile_activity_explorer(
       document.getElementById('memberId').textContent = member.member_id;
       document.getElementById('memberRole').textContent = member.role;
       document.getElementById('memberHome').textContent = `${{member.home_usage}} (${{member.home_building_id}})`;
-      document.getElementById('memberDest').textContent = `${{member.assigned_destination_usage || 'Extérieur / domicile'}} (${{member.assigned_destination_id}})`;
+      document.getElementById('memberDest').textContent = `${{member.assigned_destination_usage || 'Aucune destination interne'}} (${{member.assigned_destination_id}})`;
       document.getElementById('memberState').textContent = member.timeline_states[hour];
       document.getElementById('memberCurrent').textContent = member.timeline_labels[hour];
       renderTimeline(member);

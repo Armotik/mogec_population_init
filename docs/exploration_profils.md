@@ -1,70 +1,70 @@
-# Explorer les profils et les activites individuelles
+# Lecture des profils et des activités individuelles
 
-Ce document explique comment lire l'explorateur HTML des profils MOGEC et ce qu'il permet de verifier.
+Ce document explique comment utiliser les deux interfaces de lecture des profils MOGEC et comment interpréter ce qu'elles montrent.
 
-## 1. Objectif
+## 1. Finalité
 
-L'explorateur sert a repondre a trois questions simples :
+Ces interfaces servent à répondre à trois questions simples :
 
-- quels profils existent dans le scenario ;
-- comment chaque profil se repartit entre domicile, destinations internes et exterieur de la commune selon l'heure ;
-- a quoi ressemble la trajectoire horaire d'un individu donne.
+- quels profils existent dans le scénario ;
+- comment ces profils se répartissent entre domicile, destinations internes et extérieur de la commune selon l'heure ;
+- à quoi ressemble, heure par heure, la journée simulée d'une personne synthétique.
 
-Il ne s'agit pas d'une verite terrain individuelle. L'outil montre une trajectoire simulee, generee a partir des regles du scenario et des donnees ouvertes utilisees pour calibrer le modele.
+Il ne s'agit pas d'une observation individuelle du terrain. Les parcours affichés sont reconstruits à partir des règles du scénario et des données mobilisées dans le modèle.
 
-## 2. Deux modes d'exploration
+## 2. Deux modes d'utilisation
 
-### Mode 1. HTML autonome
+### Page HTML autonome
 
 Depuis la racine du projet :
 
 ```bash
-./.venv/bin/python scripts/generate_profile_activity_explorer.py --config config.yaml
+./.venv/bin/python main.py explore --mode html --config config.yaml
 ```
 
-Sortie par defaut :
+Sortie par défaut :
 
 `data/04_visualization/profile_activity_explorer.html`
 
-Le fichier est autonome et peut etre ouvert localement dans un navigateur.
+Cette page est autonome et peut être ouverte localement dans un navigateur.
 
-### Mode 2. Serveur web local
+### Interface web locale
 
 Depuis la racine du projet :
 
 ```bash
-./.venv/bin/python scripts/run_realtime_profile_explorer.py --config config.yaml
+./.venv/bin/python main.py explore --mode web --config config.yaml
 ```
 
-URL par defaut :
+URL par défaut :
 
 `http://127.0.0.1:8765`
 
-Ce mode est a privilegier si tu veux :
+Cette interface est plus adaptée si l'on veut :
 
-- changer l'heure en continu ;
+- faire varier l'heure en continu ;
 - basculer entre fond plan et fond satellite ;
 - suivre un foyer entier ;
-- selectionner une personne sans regenerator un fichier HTML ;
-- modifier quelques parametres de scenario directement dans l'interface ;
-- recharger le scenario depuis l'interface.
+- sélectionner une personne sans régénérer un fichier HTML ;
+- changer de scénario parmi les fichiers `config*.yaml` présents à la racine du dépôt ;
+- relancer le calcul du scénario courant ;
+- consulter la validation par proxy et ses métadonnées de traçabilité.
+- comparer un même proxy entre plusieurs scénarios déclarés dans `proxy_validation.scenario_sets`.
 
-Le fond satellite repose sur des tuiles web. Il faut donc une connexion internet cote navigateur pour cet habillage de carte.
-Si ces tuiles ne sont pas disponibles, la preview garde quand meme un fond de carte autonome et les trajectoires restent visibles.
+Le fond satellite dépend de tuiles web externes. Sans connexion côté navigateur, l'interface reste utilisable avec son fond de secours.
 
-Les modifications appliquees depuis l'interface web sont calculees en memoire pour la session en cours. Elles ne reecrivent pas `config.yaml`.
-Le bloc `Patch YAML session` permet aussi d'injecter directement un petit morceau de configuration sans sortir de la preview.
+## 3. Organisation des vues
 
-## 3. Ce que contient l'explorateur
+Les interfaces sont construites autour de plusieurs lectures complémentaires :
 
-L'interface web locale est organisee autour de quatre zones :
-
-- un resume des effectifs par profil ;
+- un résumé des effectifs par profil ;
 - un filtre de profil ;
-- un selecteur de foyer et d'individu ;
-- une vue horaire combinant synthese de profil, suivi individuel et lecture familiale.
+- un sélecteur de foyer et de personne ;
+- une lecture horaire combinant synthèse du profil, chronologie individuelle et repérage spatial.
+- pour l'interface web locale, un sélecteur de scénario ;
+- pour l'interface web locale, un panneau de validation par proxy.
 
-Profils actuellement visibles :
+Profils actuellement distingués :
 
 - `scolaire`
 - `senior`
@@ -72,119 +72,133 @@ Profils actuellement visibles :
 - `actif_navetteur`
 - `inactif`
 
-## 4. Lire les indicateurs
+## 4. Comment lire les résultats
 
-### Cartes de profil
+### Résumé par profil
 
-Les cartes du haut donnent l'effectif total de chaque profil dans le scenario.
-Elles servent a verifier rapidement qu'un profil ne disparait pas par erreur ou qu'il n'est pas sur-represente.
+Les cartes du haut donnent l'effectif total de chaque profil. Elles permettent de vérifier rapidement qu'un profil n'a pas disparu, n'est pas surreprésenté ou n'a pas été produit en quantité incohérente.
 
-### Resume horaire du profil
+### Répartition horaire
 
-Pour le profil selectionne, l'explorateur affiche heure par heure le nombre d'individus :
+Pour le profil sélectionné, l'interface indique heure par heure le nombre de personnes :
 
-- au `domicile` ;
-- sur une destination `interne` a la commune ;
-- a `l'exterieur` de la commune.
+- au domicile ;
+- dans une destination interne à la commune ;
+- à l'extérieur de la commune.
 
-Cette vue est utile pour verifier la logique temporelle :
+Cette lecture sert à vérifier la logique temporelle du scénario. Par exemple :
 
-- les `actif_navetteur` doivent quitter la commune en journee ;
-- les `actif_local` doivent davantage occuper des destinations internes ;
-- les `scolaire` ne doivent pas depasser artificiellement la capacite scolaire interne ;
-- les `inactif` doivent conserver une presence plus forte au domicile.
+- les `actif_navetteur` doivent davantage sortir de la commune en journée ;
+- les `actif_local` doivent rester plus présents sur des destinations internes ;
+- les `scolaire` ne doivent pas dépasser artificiellement la capacité scolaire disponible ;
+- les `inactif` doivent conserver une présence plus forte au domicile.
 
-### Tableau individuel
+### Chronologie individuelle
 
-Le panneau individuel montre, pour un agent selectionne :
+Le panneau individuel affiche, pour la personne sélectionnée :
 
-- son domicile ;
-- sa destination principale assignee ;
-- son etat a chaque heure ;
-- le libelle de destination a l'heure choisie.
+- son bâtiment de domicile ;
+- sa destination principale éventuelle ;
+- son état heure par heure ;
+- le lieu associé à chaque heure.
 
-Cette lecture sert a reperer les cas illogiques, par exemple :
+Cette lecture aide à repérer des cas peu plausibles, par exemple :
 
 - un navetteur qui ne quitte jamais son domicile ;
-- un scolaire affecte a l'exterieur alors qu'une capacite interne existe encore ;
-- un profil local qui passe toute la journee hors commune ;
-- des changements de destination impossibles a justifier.
+- un scolaire envoyé hors commune alors qu'une capacité locale reste disponible ;
+- un profil local absent toute la journée ;
+- une succession de lieux qui ne correspond pas à la logique attendue du scénario.
 
-### Lecture familiale
+### Lecture du foyer
 
-Sur le serveur web local, le panneau foyer permet de verifier :
+Dans l'interface web locale, le panneau foyer permet de contrôler :
 
 - la taille du foyer ;
-- la presence d'enfant(s) ;
-- le nombre d'enfants accompagnes ;
-- l'activite courante de chaque membre a l'heure choisie.
+- la présence d'enfant ;
+- le nombre d'enfants accompagnés ;
+- l'activité courante de chaque membre à l'heure choisie.
 
-Cette vue sert a reperer des incoherences de coordination familiale.
+Cette vue est utile pour vérifier la cohérence familiale, notamment autour des déplacements scolaires.
 
-### Suivi spatial simplifie
+### Validation par proxy
 
-Le schema spatial ne remplace pas une carte SIG complete. Il sert a montrer :
+Dans l'interface web locale, un panneau dédié permet aussi de lire les proxys temporels actifs du scénario.
+
+On y trouve :
+
+- le statut du proxy (`pass`, `warn`, `fail` ou `info`) ;
+- les métriques de comparaison ;
+- la courbe simulée et la courbe de référence ;
+- les éléments de traçabilité associés, par exemple la formule, la source, la date et le niveau de confiance.
+- un filtre par statut pour cibler rapidement les proxys en échec ou à surveiller ;
+- un export CSV de la synthèse et des courbes.
+- une comparaison multi-scénarios pour un proxy donné, lancée à la demande pour éviter de bloquer le changement de scénario, avec superposition des courbes simulées et export CSV dédié.
+
+Cette vue est utile pour relier la lecture qualitative des trajectoires à une lecture plus formalisée de la cohérence temporelle du scénario.
+
+### Repérage spatial
+
+La carte n'a pas vocation à remplacer un SIG complet. Elle sert à situer :
 
 - le domicile ;
-- la destination interne eventuelle ;
-- la position associee a l'heure selectionnee.
+- la destination interne éventuelle ;
+- la position associée à l'heure choisie ;
+- les changements de lieu dans la journée.
 
-Il est volontairement simple, pour permettre une lecture rapide des trajectoires individuelles.
+La représentation reste volontairement simple pour faciliter une lecture rapide.
 
-## 5. Usage recommande pour la verification
+## 5. Méthode de vérification conseillée
 
-L'explorateur est surtout utile comme outil de controle qualitatif.
+Une lecture utile consiste à :
 
-Workflow conseille :
+1. choisir un profil ;
+2. vérifier si sa répartition horaire est cohérente avec le scénario ;
+3. examiner plusieurs personnes de ce profil ;
+4. relever les cas qui paraissent peu plausibles ;
+5. revenir ensuite au code ou à la configuration pour corriger la logique.
 
-1. filtrer un profil ;
-2. verifier si la synthese horaire raconte quelque chose de plausible ;
-3. echantillonner plusieurs individus de ce profil ;
-4. noter les cas visiblement aberrants ;
-5. revenir ensuite au code ou a la configuration pour corriger la logique.
+Anomalies typiques à rechercher :
 
-Exemples d'anomalies a chercher :
+- amplitude journalière trop faible pour les actifs ;
+- trop de scolaires internes au regard des capacités déclarées ;
+- profils différents mais journées presque identiques ;
+- destinations internes attribuées à des usages peu crédibles ;
+- enfant trop éloigné de l'école sans mode d'accès plausible ;
+- adulte référent qui n'effectue jamais l'escale école alors que l'enfant est marqué `escort`.
 
-- amplitude journaliere trop faible pour les actifs ;
-- trop de scolaires internes par rapport aux capacites declarees ;
-- profils differents mais trajectoires presque identiques ;
-- destinations internes attribuees a des usages peu credibles.
-- enfant trop loin de l'ecole sans mode d'acces plausible ;
-- parent qui n'effectue jamais l'escale ecole alors que l'enfant est marque `escort`.
+## 6. Accessibilité scolaire et accompagnement
 
-## 6. Accessibilite scolaire et accompagnement
+Le modèle distingue plusieurs statuts pour les scolaires :
 
-Le modele distingue maintenant plusieurs statuts pour les scolaires :
+- `walk` : école assignée à distance compatible avec la marche ;
+- `escort` : un adulte référent effectue une escale liée à l'école ;
+- `outside_commune` : affectation scolaire hors commune ;
+- `unverified_far` : cas à surveiller, si l'école paraît trop éloignée ;
+- `inactive` : cas sans école active dans le scénario, par exemple pendant les vacances.
 
-- `walk` : l'ecole assignee est a une distance compatible avec un trajet a pied ;
-- `escort` : un parent ou adulte referent fait une escale a l'ecole avant son activite principale ou sur le retour ;
-- `outside_commune` : l'affectation scolaire sort de la commune ;
-- `unverified_far` : un cas a surveiller, si un enfant est trop loin sans mecanisme d'accompagnement exploitable ;
-- `inactive` : cas de scenario sans ecole active, par exemple vacances scolaires.
-
-Le seuil de marche et la tolerance de reprise parentale sont controles dans `config.yaml` :
+Les paramètres associés sont contrôlés dans `config.yaml` :
 
 - `temporal_model.household_dynamics.school_walk_max_distance_m`
 - `temporal_model.household_dynamics.school_pickup_overlap_hours`
 
-## 7. Limites d'interpretation
+## 7. Limites d'interprétation
 
-Il faut rester strict sur ce point :
+Il faut garder trois points en tête :
 
-- l'explorateur suit des individus synthetiques, pas des personnes reelles ;
-- la trajectoire affichee est un resultat de modele, pas un releve terrain ;
-- l'outil aide a tester la coherence du scenario, pas a prouver qu'un individu reel est a tel endroit.
+- les personnes affichées sont synthétiques, pas réelles ;
+- la trajectoire lue est un résultat de modèle, pas un relevé de terrain ;
+- l'interface aide à tester la cohérence d'un scénario, pas à prouver qu'une personne réelle se trouvait à tel endroit.
 
-Formulation robuste dans le memoire :
+Formulation possible dans le mémoire :
 
-> L'explorateur individuel est utilise comme instrument de controle qualitatif des comportements simules et de detection d'incoherences logiques entre profils, horaires et destinations.
+> L'interface individuelle sert d'outil de contrôle qualitatif pour repérer des incohérences entre profils, horaires, destinations et logiques familiales.
 
-## 8. Articulation avec la validation scientifique
+## 8. Lien avec les autres sorties
 
-L'explorateur complete les sorties du dossier `data/04_visualization/validation/`.
+Ces interfaces complètent les sorties de `data/04_visualization/validation/`.
 
-Utilisation recommandee :
+Lecture recommandée :
 
-- `validation_dashboard.png` pour les agregats globaux ;
-- `external_proxy_validation.csv` pour la confrontation a des ordres de grandeur publics ;
-- `profile_activity_explorer.html` pour l'inspection dynamique des profils et des trajectoires individuelles.
+- `validation_dashboard.png` pour les agrégats globaux ;
+- `external_proxy_validation.csv` pour la confrontation à des ordres de grandeur publics ;
+- `profile_activity_explorer.html` pour l'inspection des profils et des trajectoires individuelles.

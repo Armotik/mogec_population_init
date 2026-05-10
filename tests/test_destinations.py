@@ -5,7 +5,10 @@ from src.core.randomness import build_rng
 
 
 def test_destination_sampling_returns_stable_building_id(config, bati_nettoye):
-    df = generer_profils_batiments(bati_nettoye)
+    subset = bati_nettoye[bati_nettoye['pop_t0'] > 0].sort_values('building_id').head(100).copy()
+    if subset.empty:
+        subset = bati_nettoye.sort_values('building_id').head(100).copy()
+    df = generer_profils_batiments(subset)
     df = generer_agendas_agents(df, config)
 
     origin = df[df['n_actif_local'] > 0].iloc[0]

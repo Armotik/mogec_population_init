@@ -111,9 +111,16 @@ def load_study_area_boundary(config: dict, strict: bool = False) -> gpd.GeoDataF
     study_area = config['study_area']
     target_crs = config['project']['crs_epsg']
     buffer_m = 0 if strict else study_area.get('buffer_m', 0)
+    allow_network_fallback = bool(study_area.get('allow_network_fallback', False))
     local_boundary = _load_local_boundary(study_area, target_crs, buffer_m)
     if local_boundary is not None:
         return local_boundary
+    if not allow_network_fallback:
+        boundary_path = study_area.get('boundary_path', '<non configure>')
+        raise FileNotFoundError(
+            "Frontiere locale indisponible et fallback OSM interdit "
+            f"(study_area.allow_network_fallback=false). Chemin: {boundary_path}"
+        )
     return get_study_area_boundary(study_area['commune_name'], target_crs, buffer_m=buffer_m)
 
 

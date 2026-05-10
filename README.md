@@ -1,140 +1,143 @@
-# MOGEC - Initialisation Spatio-Temporelle de la Population
+# MOGEC - Initialisation spatio-temporelle de la population
 
-Projet d'initialisation spatiale et temporelle de la population pour la commune de Batz-sur-Mer, dans le cadre du TER de Master 1 SMART Computing.
+Projet de préparation d'une population synthétique spatialisée pour Batz-sur-Mer, réalisé dans le cadre du TER de Master 1 SMART Computing.
 
-Le pipeline Python produit un environnement initial exploitable dans GAMA :
-- une répartition bâtimentaire de la population à `T0` ;
+Le code Python produit un état initial exploitable dans GAMA :
+- une population répartie par bâtiment à `T0` ;
 - une matrice horaire `pop_h0` à `pop_h23` ;
-- des attributs d'audit pour documenter les hypothèses, les profils et les corrections appliquées.
+- des attributs d'audit pour expliciter les hypothèses et les corrections appliquées.
 
-## Objectif scientifique
+## Objectif du projet
 
-Le modèle cherche à répondre à une question simple :
+La question traitée est la suivante :
 
-> à une heure donnée, dans un scénario donné, combien de personnes sont présentes dans chaque bâtiment ou zone pertinente de la commune ?
+> à une heure donnée, dans un scénario donné, combien de personnes sont présentes dans chaque bâtiment ou zone utile de la commune ?
 
-Le cas d'usage principal est la simulation d'un événement de submersion marine de type Xynthia, mais l'architecture est paramétrable pour d'autres territoires et d'autres contextes.
+Le cas d'usage principal est un scénario de submersion marine de type Xynthia, mais la structure du projet reste paramétrable pour d'autres contextes.
 
-## Ce que fait le pipeline
+## Chaîne de traitement
 
-Le pipeline assemble plusieurs briques.
+Le traitement suit les étapes suivantes :
 
-1. Chargement de la frontière d'étude et des bâtiments.
-2. Filtrage géométrique des petites emprises non plausibles.
-3. Attribution d'un `building_id` stable.
-4. Jointure des bâtiments avec le carroyage Filosofi.
-5. Ventilation de la population résidentielle vers les bâtiments.
-6. Ajout optionnel des composantes non résidentielles :
-   - hébergements touristiques ;
-   - activités et équipements ;
-   - plages exogènes.
-7. Génération des foyers et des rôles :
-   - scolaires ;
-   - actifs locaux ;
-   - actifs navetteurs ;
-   - seniors.
-8. Affectation des destinations principales.
-9. Intégration des restaurants et des lieux de culte.
-10. Génération de la matrice horaire 24h.
-11. Export en GeoPackage pour GAMA.
+1. charger la frontière d'étude et le bâti ;
+2. filtrer les petites emprises non plausibles ;
+3. attribuer un `building_id` stable, puis marquer écoles/culte ;
+4. joindre les bâtiments avec le carroyage Filosofi ;
+5. répartir la population résidentielle ;
+6. ajouter, si besoin, les composantes non résidentielles ;
+7. reconstruire les foyers et les rôles ;
+8. affecter les destinations principales ;
+9. intégrer restaurants (les lieux de culte sont identifiés en amont) ;
+10. générer la matrice horaire sur 24 heures ;
+11. exporter le résultat au format GeoPackage.
 
 ## Structure du dépôt
 
 ```text
 mogec_population_init/
 ├── config.yaml                         # Scénario principal
-├── config_summer_day.yaml              # Exemple de scénario contrasté
-├── main.py                             # Point d'entrée du pipeline
-├── notebooks/                          # Exploration et validation scientifique
-├── scripts/                            # Téléchargement, préparation, visualisations
+├── config_summer_day.yaml              # Variante de scénario
+├── main.py                             # Point d'entrée
+├── notebooks/                          # Lecture exploratoire et validation
+├── scripts/                            # Préparation, exécution, visualisations
 ├── src/
 │   ├── core/                           # Logique métier
-│   ├── io/                             # Chargement, export, validation config
-│   └── visualization/                  # Fonctions d'appui pour cartes et notebooks
+│   ├── io/                             # Chargement, export, validation
+│   └── visualization/                  # Sorties graphiques et interfaces locales
 ├── tests/                              # Tests unitaires et d'intégration
-└── data/                               # Données brutes, intermédiaires, finales
+└── data/                               # Données brutes, intermédiaires et finales
 ```
 
 ## Modules principaux
 
 ### `src/core/`
 
-- `downscaling.py` : ventilation de la population résidentielle vers les bâtiments.
+- `downscaling.py` : répartition de la population résidentielle dans les bâtiments.
 - `agendas.py` : construction des foyers, attribution des rôles et des destinations.
-- `destinations.py` : tirage gravitaire des bâtiments destination.
+- `destinations.py` : tirage gravitaire des destinations internes.
 - `temporal.py` : génération de `pop_h0` à `pop_h23`.
-- `non_residential.py` : hébergements, activités, plages, audit du double comptage.
-- `restaurants.py` : rattachement des restaurants aux bâtiments et gestion des horaires.
+- `non_residential.py` : hébergements, activités, plages et audit du double comptage.
+- `restaurants.py` : rattachement des restaurants au bâti et gestion des horaires.
 - `cultes.py` : repérage des bâtiments de culte.
-- `identifiers.py` : création des identifiants stables.
+- `identifiers.py` : création d'identifiants stables.
 
 ### `src/io/`
 
 - `loaders.py` : chargement des couches spatiales.
 - `exporters.py` : export final GeoPackage.
 - `external_data_preparation.py` : préparation locale des données touristiques et des plages.
-- `config_validation.py` : contrôle minimal des blocs `evidence`.
+- `config_validation.py` : validation des blocs sensibles de configuration.
 
 ### `src/visualization/`
 
-- `exploration.py` : tableaux prêts à l'emploi pour notebook exploratoire.
-- `validation.py` : tableaux de validation scientifique.
+- `exploration.py` : tables prêtes à l'emploi pour notebook.
+- `validation.py` : sorties de validation scientifique.
 - `heatmap.py`, `temporal_heatmap.py` : visualisations statiques complémentaires.
+- `profile_activity.py`, `realtime_explorer.py` : lecture des profils et des trajectoires simulées.
 
 ## Configuration
 
-Toute la logique de scénario est externalisée dans `config.yaml`.
+Toute la logique de scénario est portée par `config.yaml`.
 
-Le fichier contrôle notamment :
+Le fichier règle notamment :
 - la zone d'étude ;
-- les chemins de données ;
+- la politique de fallback réseau sur la frontière (`study_area.allow_network_fallback`) ;
+- les chemins des données ;
 - les paramètres démographiques ;
 - les règles de destination ;
 - les profils temporels ;
 - l'heure réelle correspondant à `T0` via `scenario.reference_hour` ;
 - les composantes non résidentielles ;
-- les preuves et niveaux de confiance associés.
+- les sources et niveaux de confiance associés aux hypothèses.
 
-Le scénario dérivé `config_summer_day.yaml` montre comment utiliser `extends: config.yaml` pour créer un scénario contrasté sans dupliquer toute la configuration.
+Le scénario `config_summer_day.yaml` montre comment dériver une configuration avec `extends: config.yaml` sans dupliquer toute la base.
 
-## Préparation des données
+## Préparer les données
 
 ### 1. Installer l'environnement
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements-dev.txt
 ```
 
-### 2. Télécharger les données ouvertes
+Pour un environnement figé, le snapshot des dépendances installées est disponible dans `requirements-lock.txt`.
 
-Le projet contient un script rejouable :
+### 2. Télécharger les données ouvertes
 
 ```bash
 bash scripts/download_open_data.sh
 ```
+
+Le script vérifie l'intégrité SHA256 de chaque fichier avant usage, avec le manifeste versionné dans [docs/open_data_checksums.sha256](/home/armotik/Documents/Université/M1/S2/TER/docs/open_data_checksums.sha256).
 
 ### 3. Préparer les sources externes
 
 Cette étape harmonise les offres touristiques, prépare les restaurants, construit les tables de capacité et les zones de plage.
 
 ```bash
-./.venv/bin/python scripts/prepare_external_sources.py --config config.yaml
+./.venv/bin/python main.py prepare --config config.yaml
 ```
 
-## Exécuter le pipeline
+## Exécuter le modèle
 
 ### Scénario principal
 
 ```bash
-./.venv/bin/python main.py --config config.yaml
+./.venv/bin/python main.py run --config config.yaml
 ```
 
-### Scénario contrasté
+### Variante de scénario
 
 ```bash
-./.venv/bin/python main.py --config config_summer_day.yaml
+./.venv/bin/python main.py run --config config_summer_day.yaml
+```
+
+### Validation dry-run (sans pipeline lourd)
+
+```bash
+./.venv/bin/python main.py validate --config config.yaml
 ```
 
 ## Sorties principales
@@ -145,16 +148,16 @@ Le fichier principal est :
 
 `data/03_processed/population_batz_t0.gpkg`
 
-Il contient notamment :
+On y retrouve notamment :
 - `building_id` : identifiant stable ;
 - `usage_1` : type d'usage du bâtiment ;
-- `pop_t0` : population présente à l'état initial du scénario, correspondant à `scenario.reference_hour` ;
-- `pop_h0` à `pop_h23` : population présente par heure ;
+- `pop_t0` : population présente à l'état initial du scénario ;
+- `pop_h0` à `pop_h23` : population présente à chaque heure ;
 - `reference_hour` : heure réelle associée à `T0` ;
 - `n_scolaire`, `n_senior`, `n_actif_local`, `n_actif_navetteur` ;
 - `pop_nonres_accommodation`, `pop_nonres_activity` ;
-- colonnes d'audit du double comptage ;
-- attributs POI `is_restaurant`, `is_culte`.
+- les colonnes d'audit du double comptage ;
+- les indicateurs POI `is_restaurant`, `is_culte`.
 
 ### Tables intermédiaires utiles
 
@@ -165,82 +168,115 @@ Dans `data/02_interim/external/` :
 - `batz_accommodation_overlap_audit.csv`
 - `batz_beaches.gpkg`
 
-## Notebooks
+## Lecture et validation
 
-Deux notebooks servent à la lecture scientifique du modèle.
+### Notebooks
 
 - `notebooks/visualisation_exploratoire.ipynb`
-  Vue exploratoire simple : cartes de `T0`, courbes horaires, types de destination.
+  Lecture simple de `T0`, des courbes horaires et des types de destination.
 
 - `notebooks/validation_scientifique_modele.ipynb`
-  Validation interne : structure du GeoPackage, métriques globales, rôle cible vs rôle réalisé, non résidentiel, bâtiments les plus variables.
+  Vérification de la structure du GeoPackage, des métriques globales, des rôles réalisés et des composantes non résidentielles.
 
-Un script autonome permet de générer un dossier de validation réutilisable hors notebook :
+### Scripts de lecture
+
+Générer un dossier de validation hors notebook :
 
 ```bash
 ./.venv/bin/python scripts/generate_scientific_validation.py --config config.yaml
 ```
 
-Pour comparer plusieurs scenarios a des courbes de reference publiques ou documentees :
+Comparer un ou plusieurs scénarios à des courbes de référence publiques :
 
 ```bash
-./.venv/bin/python scripts/run_proxy_validation.py --config config.yaml
+./.venv/bin/python main.py proxy-validate --config config.yaml
 ```
 
-Un second script génère un explorateur HTML autonome pour visualiser les profils, leurs activités et suivre un individu heure par heure :
+Générer une page HTML autonome pour lire les profils et les activités simulées :
 
 ```bash
-./.venv/bin/python scripts/generate_profile_activity_explorer.py --config config.yaml
+./.venv/bin/python main.py explore --mode html --config config.yaml
 ```
 
-Pour une exploration web locale servie en direct, avec lecture horaire, filtre par foyer, suivi individuel et fond satellite :
+Lancer une interface web locale avec lecture horaire, filtre par foyer et carte :
 
 ```bash
-./.venv/bin/python scripts/run_realtime_profile_explorer.py --config config.yaml
+./.venv/bin/python main.py explore --mode web --config config.yaml
 ```
 
-Cette interface permet aussi d'ajuster en direct quelques parametres clefs du scenario et de recalculer la simulation sans modifier le fichier YAML sur disque.
-Elle expose aussi un `Patch YAML session` pour tester rapidement des variations de configuration directement depuis la preview.
+L'interface locale permet de charger l'un des scénarios `config*.yaml` présents à la racine du dépôt, puis d'examiner en direct les profils, les trajectoires et la validation par proxy associée au scénario actif.
 
-Voir aussi :
+### Documentation associée
 
 - `docs/validation_scientifique.md`
-  Cadre méthodologique détaillé pour distinguer cohérence interne, traçabilité des hypothèses et confrontation externe.
-- `docs/proxy_validation.md`
-  Mise en place d'une validation temporelle par proxys, sur un ou plusieurs scénarios.
-- `docs/exploration_profils.md`
-  Mode d'emploi des explorateurs de profils, en HTML autonome ou en serveur web local, pour filtrer un rôle, suivre un agent ou un foyer et lire les activités simulées dans le temps.
+  Cadre méthodologique pour distinguer cohérence interne, traçabilité des hypothèses et confrontation externe.
 
-Le dossier généré contient aussi `external_proxy_validation.csv`, qui compare le modèle à quelques proxys publics déjà mobilisés dans la configuration, par exemple les emplois locaux et les capacités scolaires.
-L'explorateur HTML est écrit par défaut dans `data/04_visualization/profile_activity_explorer.html`.
-Le serveur web local expose par défaut l'interface sur `http://127.0.0.1:8765`.
+- `docs/proxy_validation.md`
+  Validation temporelle par proxys, sur un ou plusieurs scénarios.
+
+- `docs/exploration_profils.md`
+  Guide de lecture des vues HTML et web locales pour inspecter les profils, les foyers et les trajectoires simulées.
+
+- `docs/config_reference.md`
+  Référence synthétique des blocs de configuration et de leurs effets sur le modèle.
+
+- `docs/fonctionnement_modele.md`
+  Guide de fonctionnement et de réutilisation du modèle pour un lecteur voulant reprendre le projet sur un autre terrain.
+
+Le dossier de validation contient aussi `external_proxy_validation.csv`, qui confronte le modèle à quelques proxys publics mobilisés dans la configuration. La page HTML autonome est écrite par défaut dans `data/04_visualization/profile_activity_explorer.html` et le serveur local est exposé par défaut sur `http://127.0.0.1:8765`.
+
+## CLI unifiée
+
+La CLI unique est portée par `main.py` avec sous-commandes :
+
+```bash
+./.venv/bin/python main.py run --config config.yaml
+./.venv/bin/python main.py prepare --config config.yaml
+./.venv/bin/python main.py validate --config config.yaml
+./.venv/bin/python main.py explore --mode web --config config.yaml
+./.venv/bin/python main.py proxy-validate --config config.yaml
+```
+
+Les scripts historiques de `scripts/` restent utilisables comme wrappers de compatibilité.
+
+Niveaux de verbosité CLI :
+
+```bash
+./.venv/bin/python main.py -v validate --config config.yaml
+./.venv/bin/python main.py -vv proxy-validate --config config.yaml
+```
 
 ## Tests
 
-Lancer l'ensemble de la suite :
+Lancer toute la suite :
 
 ```bash
 ./.venv/bin/pytest -q
 ```
 
-Quelques blocs utiles à tester isolément :
+Découpage par marqueurs :
 
 ```bash
-./.venv/bin/pytest -q tests/test_agendas.py
-./.venv/bin/pytest -q tests/test_temporal.py
-./.venv/bin/pytest -q tests/test_non_residential.py
-./.venv/bin/pytest -q tests/test_validation_helpers.py
+./.venv/bin/pytest -q -m "unit"
+./.venv/bin/pytest -q -m "integration and not slow"
+./.venv/bin/pytest -q -m "slow"
 ```
 
-## État scientifique du modèle
+Couverture locale :
+
+```bash
+./.venv/bin/pytest -q -m "unit" --cov=src --cov-report=term-missing --cov-report=xml --cov-config=.coveragerc
+```
+
+## État actuel du modèle
 
 Le projet fournit aujourd'hui :
-- une cohérence structurelle forte de l'export ;
-- une reproductibilité stricte par seed ;
+- une structure d'export cohérente ;
+- une reproductibilité contrôlée par graine ;
 - des scénarios paramétrables ;
 - une documentation des hypothèses non résidentielles via les blocs `evidence`.
 
-Le modèle reste un modèle simulé calibré par données, pas une observation directe du terrain. Les points à discuter dans le mémoire sont donc :
+Le modèle reste une reconstruction simulée à partir de données et d'hypothèses. Les points à discuter dans le mémoire portent donc surtout sur :
 - la qualité des hypothèses horaires ;
 - la calibration des composantes d'activité ;
 - la représentativité des données touristiques ;
